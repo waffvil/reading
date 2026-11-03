@@ -1,0 +1,4 @@
+.DS_Store
+# This repo is public. PDFs are blocked by default so a purchased book never gets published by accident.
+# Only public-domain / freely licensed files belong in books/ — add those with `git add -f`.
+*.pdf

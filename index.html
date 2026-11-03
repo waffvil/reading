@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <title>Shelf</title>
+  <meta name="description" content="An offline PDF reader that remembers where you left off.">
+  <meta name="theme-color" content="#f6f1e7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1c1915" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Shelf">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icon-192.png">
+  <link rel="apple-touch-icon" href="icon-180.png">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+  <!-- ================= LIBRARY ================= -->
+  <main id="library" class="view">
+    <header class="lib-head">
+      <h1>Shelf</h1>
+      <label class="btn primary" for="file-input">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        Add PDF
+      </label>
+      <input id="file-input" type="file" accept="application/pdf,.pdf" multiple hidden>
+    </header>
+
+    <section id="continue" hidden></section>
+
+    <section>
+      <h2 class="section-title" id="books-title" hidden>Your books</h2>
+      <div id="books" class="grid"></div>
+    </section>
+
+    <section id="hosted-wrap" hidden>
+      <h2 class="section-title">Available to download</h2>
+      <div id="hosted" class="list"></div>
+    </section>
+
+    <div id="empty" class="empty" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H10a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4z"/><path d="M20 5.5A1.5 1.5 0 0 0 18.5 4H14a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z"/></svg>
+      <h2>No books yet</h2>
+      <p>Tap <b>Add PDF</b> and pick a file from Files, Downloads or iCloud Drive. It's saved on this device, so it opens with no internet.</p>
+    </div>
+
+    <footer class="lib-foot">
+      <span id="storage-info"></span>
+      <span id="offline-badge" hidden>Offline</span>
+    </footer>
+  </main>
+
+  <!-- ================= READER ================= -->
+  <section id="reader" class="view" hidden>
+    <div id="scroller"><div id="pages"></div></div>
+
+    <header id="topbar" class="bar top">
+      <button class="icon-btn" id="btn-back" aria-label="Back to library">
+        <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+      </button>
+      <div class="bar-title" id="reader-title"></div>
+      <button class="icon-btn" id="btn-mark" aria-label="Bookmark this spot">
+        <svg viewBox="0 0 24 24"><path d="M6 4h12v17l-6-4-6 4z"/></svg>
+      </button>
+      <button class="icon-btn" id="btn-panel" aria-label="Contents and bookmarks">
+        <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+      </button>
+      <button class="icon-btn" id="btn-settings" aria-label="Display settings">
+        <svg viewBox="0 0 24 24"><path d="M4 19l5-14h1l5 14M6 14h7M16 19l2.5-7h.5l2.5 7M17 17h4"/></svg>
+      </button>
+    </header>
+
+    <footer id="bottombar" class="bar bottom">
+      <input id="page-slider" type="range" min="1" max="1" value="1" aria-label="Page">
+      <div class="page-label"><span id="page-label">–</span><span id="pct-label"></span></div>
+    </footer>
+
+    <div id="hint" class="hint" hidden>Long-press any word to bookmark it · tap to show or hide controls</div>
+  </section>
+
+  <!-- ================= SHEETS ================= -->
+  <div id="scrim" hidden></div>
+
+  <div id="panel" class="sheet" hidden role="dialog" aria-label="Contents and bookmarks">
+    <div class="sheet-grip"></div>
+    <div class="tabs" role="tablist">
+      <button role="tab" data-tab="marks" aria-selected="true">Bookmarks</button>
+      <button role="tab" data-tab="toc" aria-selected="false">Contents</button>
+    </div>
+    <div class="sheet-body">
+      <div id="tab-marks"></div>
+      <div id="tab-toc" hidden></div>
+    </div>
+  </div>
+
+  <div id="settings" class="sheet" hidden role="dialog" aria-label="Display settings">
+    <div class="sheet-grip"></div>
+    <div class="sheet-body pad">
+      <div class="setting">
+        <div class="setting-label">Theme</div>
+        <div class="seg" id="seg-theme">
+          <button data-v="auto">Auto</button>
+          <button data-v="light">Light</button>
+          <button data-v="sepia">Sepia</button>
+          <button data-v="dark">Dark</button>
+        </div>
+      </div>
+      <div class="setting">
+        <div class="setting-label">Zoom</div>
+        <div class="seg" id="seg-zoom">
+          <button data-v="1">Fit</button>
+          <button data-v="1.25">125%</button>
+          <button data-v="1.5">150%</button>
+          <button data-v="2">200%</button>
+        </div>
+      </div>
+      <div class="setting">
+        <div class="setting-label">Margins</div>
+        <div class="seg" id="seg-crop">
+          <button data-v="0">Full page</button>
+          <button data-v="1">Trim margins</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="sheet-book" class="sheet" hidden role="dialog" aria-label="Book options">
+    <div class="sheet-grip"></div>
+    <div class="sheet-body pad">
+      <div class="sheet-book-title" id="sb-title"></div>
+      <button class="row-btn danger" id="sb-delete">Remove from this device</button>
+      <button class="row-btn" id="sb-cancel">Cancel</button>
+    </div>
+  </div>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <div id="busy" hidden><div class="spinner"></div><div id="busy-text">Loading…</div></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
