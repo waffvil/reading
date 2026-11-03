@@ -62,6 +62,9 @@
         <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
       </button>
       <div class="bar-title" id="reader-title"></div>
+      <button class="icon-btn" id="btn-listen" aria-label="Read aloud">
+        <svg viewBox="0 0 24 24"><path d="M4 15v-3a8 8 0 0 1 16 0v3"/><rect x="3" y="14" width="4" height="6" rx="1.5"/><rect x="17" y="14" width="4" height="6" rx="1.5"/></svg>
+      </button>
       <button class="icon-btn" id="btn-mark" aria-label="Bookmark this spot">
         <svg viewBox="0 0 24 24"><path d="M6 4h12v17l-6-4-6 4z"/></svg>
       </button>
@@ -77,6 +80,20 @@
       <input id="page-slider" type="range" min="1" max="1" value="1" aria-label="Page">
       <div class="page-label"><span id="page-label">–</span><span id="pct-label"></span></div>
     </footer>
+
+    <div id="player" class="player" hidden role="group" aria-label="Read aloud">
+      <button class="icon-btn" id="tts-prev" aria-label="Previous sentence">
+        <svg viewBox="0 0 24 24"><path d="M18 18l-8-6 8-6zM6 6v12"/></svg>
+      </button>
+      <button class="icon-btn play" id="tts-play" aria-label="Play"></button>
+      <button class="icon-btn" id="tts-next" aria-label="Next sentence">
+        <svg viewBox="0 0 24 24"><path d="M6 6l8 6-8 6zM18 6v12"/></svg>
+      </button>
+      <button class="rate" id="tts-rate" aria-label="Reading speed">1×</button>
+      <button class="icon-btn" id="tts-close" aria-label="Stop reading aloud">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
 
     <div id="hint" class="hint" hidden>Long-press any word to bookmark it · tap to show or hide controls</div>
   </section>
@@ -116,6 +133,11 @@
           <button data-v="1.5">150%</button>
           <button data-v="2">200%</button>
         </div>
+      </div>
+      <div class="setting">
+        <div class="setting-label">Read-aloud voice</div>
+        <select id="voice-select" class="select" aria-label="Read-aloud voice"></select>
+        <p class="setting-note">For a more natural voice on iPhone: Settings → Accessibility → Spoken Content → Voices → English, and download an <b>Enhanced</b> or <b>Premium</b> voice. It then appears here and works offline.</p>
       </div>
       <div class="setting">
         <div class="setting-label">Margins</div>

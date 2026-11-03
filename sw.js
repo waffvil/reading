@@ -1,6 +1,6 @@
 // Shelf service worker. Everything the app needs is stored at install, so it opens with no network.
 // Books themselves live in IndexedDB (see app.js), not here. Bump VERSION on every deploy.
-const VERSION = "shelf-v1";
+const VERSION = "shelf-v2"; // v2: read aloud
 importScripts("precache.js");
 
 self.addEventListener("install", (e) => {

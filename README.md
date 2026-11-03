@@ -7,6 +7,12 @@ A free, offline PDF reader for your phone. A home-screen app, hosted on GitHub P
 - **Remembers your place:** your position is saved as you scroll, down to the spot on the page.
 - **Bookmarks:** long-press any word to bookmark it. It's highlighted on the page and listed, with the
   surrounding sentence, under ☰ → Bookmarks. The ribbon button bookmarks the top of the screen.
+- **Read aloud (audiobook mode):** tap the headphones. It reads from the first line on screen, one
+  sentence at a time, highlighting each sentence, following along and turning pages by itself. There's a
+  player with back, play/pause, next and speed (0.8–2×), and a voice picker in Aa. It uses the device's
+  built-in voices, so it's free, and offline on iPhone. Better voices: iPhone Settings → Accessibility →
+  Spoken Content → Voices → download an "Enhanced" or "Premium" English voice. Scanned PDFs (images,
+  no text layer) can't be read aloud.
 - **Reading comfort:** Light, Sepia and Dark themes; pinch to zoom; "Trim margins" makes small print
   larger on a phone; a table of contents (when the PDF has one); a page slider.
 

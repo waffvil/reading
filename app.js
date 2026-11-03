@@ -340,6 +340,9 @@ async function openBook(id) {
   R.marks = await idb.marksFor(id);
   R.sizes = new Array(book.pages + 1);
   R.toc = null;
+  T.cache = new Map();
+  T.sents = [];
+  T.bookId = null;
   book.lastOpened = Date.now();
   idb.put("books", book);
 
@@ -374,7 +377,7 @@ function buildPages() {
     const el = document.createElement("div");
     el.className = "page";
     el.dataset.i = i;
-    el.innerHTML = `<div class="num">${i}</div><div class="page-inner"><div class="marks"></div></div>`;
+    el.innerHTML = `<div class="num">${i}</div><div class="page-inner"><div class="marks"></div><div class="tts-hl"></div></div>`;
     frag.append(el);
     R.pageEls.push(el);
   }
@@ -517,6 +520,7 @@ function savePos() {
 let lastScrollTop = 0, rafPending = false, chromeAnchor = 0;
 scroller.addEventListener("scroll", () => {
   cancelPress();
+  if (Date.now() > T.progScrollUntil) T.userScrollAt = Date.now();
   if (!rafPending) {
     rafPending = true;
     requestAnimationFrame(() => { rafPending = false; updatePosUI(); });
@@ -882,9 +886,343 @@ $("#seg-crop").addEventListener("click", (e) => {
   relayout();
 });
 
+// ================================================================ LISTEN (text-to-speech)
+// Uses the voices built into the device (Web Speech API): free, and on iPhone fully offline.
+// Text comes from pdf.js page by page; it is spoken one sentence at a time, because long utterances
+// get cut off (Chrome) or stall (iOS), and sentence-sized steps give clean skip / highlight / resume.
+const synth = window.speechSynthesis;
+const RATES = [0.8, 1, 1.15, 1.3, 1.5, 1.75, 2];
+const NOVELTY = /^(albert|bad news|bahh|bells|boing|bubbles|cellos|good news|jester|organ|superstar|trinoids|whisper|wobble|zarvox|fred|junior|ralph|kathy|eddy|flo|grandma|grandpa|reed|rocko|sandy|shelley)\b/i;
+const T = {
+  playing: false, bookId: null, page: 0, sents: [], idx: 0, gen: 0, cache: new Map(),
+  userScrollAt: 0, progScrollUntil: 0, wake: null, voices: [], started: false, hlPage: 0,
+};
+
+function loadVoices() {
+  if (!synth) return;
+  const lang = (navigator.language || "en").slice(0, 2).toLowerCase();
+  const score = (v) => {
+    const l = v.lang.toLowerCase();
+    let s = 0;
+    if (l.startsWith(lang)) s += 100;
+    if (l.startsWith("en")) s += 50;
+    if (v.localService) s += 20;
+    if (/premium|enhanced|natural|neural/i.test(v.name)) s += 15;
+    if (/siri/i.test(v.name)) s += 10;
+    if (v.default) s += 5;
+    if (NOVELTY.test(v.name)) s -= 80;
+    return s;
+  };
+  T.voices = synth.getVoices().slice().sort((a, b) => score(b) - score(a));
+  renderVoiceSelect();
+}
+function currentVoice() {
+  const uri = prefs.get("voice", "");
+  return T.voices.find((v) => v.voiceURI === uri) || T.voices[0] || null;
+}
+function renderVoiceSelect() {
+  const sel = $("#voice-select");
+  if (!sel) return;
+  const lang = (navigator.language || "en").slice(0, 2).toLowerCase();
+  const list = T.voices.filter((v) => !NOVELTY.test(v.name) && (v.lang.toLowerCase().startsWith(lang) || v.lang.toLowerCase().startsWith("en")));
+  const cur = currentVoice();
+  sel.innerHTML = list.length
+    ? list.map((v) => `<option value="${esc(v.voiceURI)}"${v === cur ? " selected" : ""}>${esc(v.name)} (${esc(v.lang)})${v.localService ? "" : " · online only"}</option>`).join("")
+    : `<option value="">No voices on this device</option>`;
+}
+if (synth) {
+  loadVoices();
+  synth.addEventListener?.("voiceschanged", loadVoices);
+}
+
+// ---- text → sentences, each with highlight boxes in page fractions
+const ABBR = /^(mr|mrs|ms|dr|st|vs|etc|cf|fig|figs|no|vol|pp|p|e\.g|i\.e|inc|ltd|jr|sr|prof|ch|eq|approx)$/i;
+function splitSentences(text) {
+  const cuts = [];
+  let start = 0, m;
+  const re = /[.!?…]+["'”’)\]]*\s+/g;
+  while ((m = re.exec(text))) {
+    const prev = (text.slice(start, m.index).match(/(\S+)$/) || [, ""])[1];
+    if (ABBR.test(prev.replace(/\.$/, "")) || /^[A-Z]$/.test(prev)) continue;
+    cuts.push([start, m.index + m[0].length]);
+    start = m.index + m[0].length;
+  }
+  if (start < text.length) cuts.push([start, text.length]);
+  // merge fragments that are too short to stand alone; break up run-ons
+  const out = [];
+  for (const c of cuts) {
+    const last = out[out.length - 1];
+    if (last && text.slice(last[0], last[1]).trim().length < 24) last[1] = c[1];
+    else out.push([...c]);
+  }
+  const final = [];
+  for (let [a, b] of out) {
+    while (b - a > 280) {
+      const seg = text.slice(a, a + 280);
+      let k = Math.max(seg.lastIndexOf("; "), seg.lastIndexOf(", "), seg.lastIndexOf(": "));
+      if (k < 80) k = seg.lastIndexOf(" ");
+      if (k < 40) k = 280;
+      final.push([a, a + k + 1]);
+      a += k + 1;
+    }
+    final.push([a, b]);
+  }
+  return final;
+}
+
+async function sentencesFor(i) {
+  if (T.cache.has(i)) return T.cache.get(i);
+  const pdf = R.pdf;
+  const page = await pdf.getPage(i);
+  const vp = page.getViewport({ scale: 1 });
+  const tc = await page.getTextContent();
+  let text = "";
+  const runs = [];
+  let prev = null;
+  for (const it of tc.items) {
+    if (typeof it.str !== "string") continue;
+    const tx = pdfjsLib.Util.transform(vp.transform, it.transform);
+    const fh = Math.hypot(tx[2], tx[3]) || 10;
+    if (it.str) {
+      // glue items on the same line with a space when the PDF left a visual gap but no space character
+      if (prev && Math.abs(tx[5] - prev.base) < fh * 0.4 && tx[4] - prev.right > fh * 0.18 && !/\s$/.test(text) && !/^\s/.test(it.str)) text += " ";
+      else if (prev && Math.abs(tx[5] - prev.base) >= fh * 0.4 && text && !/\s$/.test(text)) text += " ";
+      const start = text.length;
+      text += it.str;
+      runs.push({
+        start, end: text.length,
+        x: tx[4] / vp.width, y: (tx[5] - fh * 0.86) / vp.height,
+        w: it.width / vp.width, h: (fh * 1.12) / vp.height,
+      });
+      prev = { base: tx[5], right: tx[4] + it.width };
+    }
+    if (it.hasEOL) {
+      if (/\p{L}[-‐]$/u.test(text)) text = text.slice(0, -1); // re-join a word hyphenated across lines
+      else if (text && !/\s$/.test(text)) text += " ";
+      prev = null;
+    }
+  }
+  const sents = [];
+  for (const [a, b] of splitSentences(text)) {
+    const t = text.slice(a, b).replace(/\s+/g, " ").trim();
+    if (!/\p{L}/u.test(t)) continue; // page numbers, stray symbols
+    const boxes = [];
+    for (const r of runs) {
+      if (r.end <= a || r.start >= b) continue;
+      const len = Math.max(1, r.end - r.start);
+      const f0 = Math.max(0, (a - r.start) / len), f1 = Math.min(1, (b - r.start) / len);
+      boxes.push({ x: r.x + r.w * f0, y: r.y, w: r.w * (f1 - f0), h: r.h });
+    }
+    if (!boxes.length) continue;
+    sents.push({ text: t, boxes, top: Math.min(...boxes.map((x) => x.y)), bottom: Math.max(...boxes.map((x) => x.y + x.h)) });
+  }
+  // drop running heads / footers: a short line hugging the top or bottom edge with no sentence ending
+  const edge = (s) => s.text.length < 60 && !/[.!?…]["'”’)]*$/.test(s.text) && (s.bottom < 0.1 || s.top > 0.9);
+  while (sents.length && edge(sents[0])) sents.shift();
+  while (sents.length && edge(sents[sents.length - 1])) sents.pop();
+  if (pdf === R.pdf) T.cache.set(i, sents);
+  return sents;
+}
+
+// ---- geometry helpers
+function pageInnerY(page, f) {
+  const el = R.pageEls[page - 1];
+  const inner = el.lastElementChild;
+  return el.offsetTop + inner.offsetTop + f * inner.offsetHeight;
+}
+function viewFrac() {
+  // the first line of text visible below the top bar
+  const y = scroller.scrollTop + 64;
+  const k = pageIndexAtY(y);
+  const el = R.pageEls[k], inner = el.lastElementChild;
+  return { page: k + 1, f: (y - el.offsetTop - inner.offsetTop) / inner.offsetHeight };
+}
+function onScreen(page, s) {
+  if (!s) return false;
+  const y = pageInnerY(page, s.top);
+  return y > scroller.scrollTop && y < scroller.scrollTop + scroller.clientHeight;
+}
+function follow(s, force) {
+  if (!s || !R.book) return;
+  if (!force && Date.now() - T.userScrollAt < 6000) return; // the reader is looking elsewhere; don't yank them back
+  const y = pageInnerY(T.page, s.top);
+  const st = scroller.scrollTop, h = scroller.clientHeight;
+  if (!force && y > st + 70 && pageInnerY(T.page, s.bottom) < st + h * 0.72) return;
+  T.progScrollUntil = Date.now() + 1200;
+  scroller.scrollTo({ top: y - h * 0.3, behavior: "smooth" });
+}
+function drawTts(s) {
+  if (T.hlPage) { const old = R.pageEls[T.hlPage - 1]?.querySelector(".tts-hl"); if (old) old.innerHTML = ""; }
+  T.hlPage = 0;
+  if (!s || !R.book) return;
+  const layer = R.pageEls[T.page - 1]?.querySelector(".tts-hl");
+  if (!layer) return;
+  layer.innerHTML = s.boxes.map((b) => `<div class="tts-box" style="left:${b.x * 100}%;top:${b.y * 100}%;width:${b.w * 100}%;height:${b.h * 100}%"></div>`).join("");
+  T.hlPage = T.page;
+}
+
+// ---- playback
+function speakCurrent(retry = false) {
+  const s = T.sents[T.idx];
+  if (!s) return;
+  const gen = ++T.gen;
+  const u = new SpeechSynthesisUtterance(s.text);
+  const v = currentVoice();
+  if (v) { try { u.voice = v; u.lang = v.lang; } catch {} }
+  u.rate = prefs.get("rate", 1);
+  u.onstart = () => { if (gen === T.gen) T.started = true; };
+  u.onend = () => { if (gen === T.gen && T.playing) advance(); };
+  u.onerror = (e) => {
+    if (gen !== T.gen || !T.playing || e.error === "interrupted" || e.error === "canceled") return;
+    if (e.error === "not-allowed") { ttsPause(); toast("Tap play to start reading aloud"); return; }
+    console.warn("tts", e.error);
+    advance();
+  };
+  T.utter = u; // keep a reference: Chrome drops events for garbage-collected utterances
+  T.started = false;
+  if (synth.speaking || synth.pending) {
+    synth.cancel();
+    setTimeout(() => { if (gen === T.gen && T.playing) synth.speak(u); }, 60);
+  } else synth.speak(u);
+  // a wedged speech engine never starts and never errors — retry once, then say so instead of hanging
+  setTimeout(() => {
+    if (gen !== T.gen || !T.playing || T.started || document.hidden) return;
+    if (!retry) { try { synth.cancel(); } catch {} return speakCurrent(true); }
+    ttsPause();
+    toast("The device's speech engine isn't responding — try again, or restart the app", 4500);
+  }, 4000);
+  drawTts(s);
+  follow(s);
+  updatePlayer();
+}
+
+async function advance() {
+  T.idx++;
+  let empties = 0;
+  while (T.idx >= T.sents.length) {
+    if (T.page >= R.book.pages) { ttsPause(); drawTts(null); toast("Finished — end of the book"); return; }
+    if (++empties > 8) { ttsPause(); toast("No readable text here — this part may be a scanned image", 4000); return; }
+    const gen = T.gen;
+    T.page++;
+    T.idx = 0;
+    T.sents = await sentencesFor(T.page);
+    if (gen !== T.gen || !T.playing) return;
+  }
+  speakCurrent();
+  if (T.idx >= T.sents.length - 3 && T.page < R.book.pages) sentencesFor(T.page + 1).catch(() => {});
+}
+
+async function ttsPlay() {
+  if (!synth) return toast("This browser can't read aloud");
+  // iOS only lets speech start inside a tap: speak a silent blip now, before any await
+  try { const w = new SpeechSynthesisUtterance(" "); w.volume = 0; synth.speak(w); } catch {}
+  T.playing = true;
+  $("#player").hidden = false;
+  updatePlayer();
+  acquireWake();
+  const gen = ++T.gen;
+  const resume = T.bookId === R.book.id && T.sents[T.idx] && onScreen(T.page, T.sents[T.idx]);
+  if (resume) return speakCurrent();
+  T.bookId = R.book.id;
+  const v = viewFrac();
+  const sents = await sentencesFor(v.page);
+  if (gen !== T.gen || !T.playing) return;
+  T.page = v.page;
+  T.sents = sents;
+  const k = sents.findIndex((s) => s.top >= v.f - 0.01);
+  T.idx = (k === -1 ? sents.length : k) - 1;
+  T.userScrollAt = 0;
+  advance();
+}
+function ttsPause() {
+  T.playing = false;
+  T.gen++;
+  try { synth?.cancel(); } catch {}
+  releaseWake();
+  updatePlayer();
+}
+function ttsStop() {
+  ttsPause();
+  drawTts(null);
+  $("#player").hidden = true;
+}
+async function ttsSkip(dir) {
+  if (!T.sents.length) return;
+  if (dir > 0) {
+    if (T.playing) { T.gen++; return advance(); }
+    if (T.idx < T.sents.length - 1) T.idx++;
+    else if (T.page < R.book.pages) { T.page++; T.sents = await sentencesFor(T.page); T.idx = 0; }
+  } else {
+    if (T.idx > 0) T.idx--;
+    else if (T.page > 1) { T.page--; T.sents = await sentencesFor(T.page); T.idx = Math.max(0, T.sents.length - 1); }
+  }
+  if (T.playing) speakCurrent();
+  else { drawTts(T.sents[T.idx]); follow(T.sents[T.idx], true); }
+}
+function updatePlayer() {
+  const btn = $("#tts-play");
+  btn.innerHTML = T.playing
+    ? `<svg viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></svg>`
+    : `<svg viewBox="0 0 24 24"><path d="M7 4.5v15l12.5-7.5z"/></svg>`;
+  btn.setAttribute("aria-label", T.playing ? "Pause" : "Play");
+  $("#tts-rate").textContent = prefs.get("rate", 1) + "×";
+  $("#btn-listen").classList.toggle("on", T.playing);
+  if ("mediaSession" in navigator) {
+    try {
+      navigator.mediaSession.playbackState = T.playing ? "playing" : "paused";
+      if (R.book) navigator.mediaSession.metadata = new MediaMetadata({ title: R.book.title, artist: R.book.author || "Shelf", album: `Page ${T.page || 1}` });
+    } catch {}
+  }
+}
+async function acquireWake() { try { T.wake = await navigator.wakeLock?.request("screen"); } catch {} }
+function releaseWake() { try { T.wake?.release(); } catch {} T.wake = null; }
+
+$("#btn-listen").addEventListener("click", () => { if (T.playing) ttsPause(); else ttsPlay(); });
+$("#tts-play").addEventListener("click", () => { if (T.playing) ttsPause(); else ttsPlay(); });
+$("#tts-prev").addEventListener("click", () => ttsSkip(-1));
+$("#tts-next").addEventListener("click", () => ttsSkip(1));
+$("#tts-close").addEventListener("click", ttsStop);
+$("#tts-rate").addEventListener("click", () => {
+  const r = prefs.get("rate", 1);
+  const next = RATES[(RATES.indexOf(r) + 1) % RATES.length] || 1;
+  prefs.set("rate", next);
+  updatePlayer();
+  if (T.playing) speakCurrent();
+});
+$("#voice-select").addEventListener("change", (e) => {
+  prefs.set("voice", e.target.value);
+  if (T.playing) return speakCurrent();
+  try {
+    synth.cancel();
+    const u = new SpeechSynthesisUtterance("This is how I'll read your book.");
+    const v = currentVoice();
+    if (v) { try { u.voice = v; u.lang = v.lang; } catch {} }
+    u.rate = prefs.get("rate", 1);
+    synth.speak(u);
+  } catch {}
+});
+if ("mediaSession" in navigator) {
+  try {
+    navigator.mediaSession.setActionHandler("play", () => R.book && ttsPlay());
+    navigator.mediaSession.setActionHandler("pause", ttsPause);
+    navigator.mediaSession.setActionHandler("nexttrack", () => ttsSkip(1));
+    navigator.mediaSession.setActionHandler("previoustrack", () => ttsSkip(-1));
+  } catch {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden || !T.playing) return;
+  acquireWake();
+  if (!synth.speaking && !synth.pending) speakCurrent(); // the OS paused us while away — pick the sentence back up
+});
+// safety net: some engines finish an utterance without ever firing "end"
+setInterval(() => {
+  if (T.playing && T.started && !document.hidden && !synth.speaking && !synth.pending) { T.started = false; advance(); }
+}, 1500);
+
 // ---------------------------------------------------------------- close
 async function closeReader() {
   if (!R.book) return;
+  ttsStop();
   closeSheet();
   await savePos();
   R.io?.disconnect();
