@@ -1184,37 +1184,72 @@ function splitSentences(text) {
   return final;
 }
 
+// Letter-spaced text ("C H A P T E R   O N E") comes out of pdf.js with a space between every letter. Rejoin the
+// letters; a wider gap (two or more spaces) is a real word break.
+function unspace(str) {
+  const toks = str.trim().split(/ +/);
+  if (toks.length < 3 || toks.filter((t) => t.length === 1 && /\p{L}/u.test(t)).length / toks.length < 0.8) return str;
+  const lead = /^\s/.test(str) ? " " : "", trail = /\s$/.test(str) ? " " : "";
+  return lead + str.trim().split(/ {2,}/).map((w) => w.replace(/ /g, "")).join(" ") + trail;
+}
 async function sentencesFor(i) {
   if (T.cache.has(i)) return T.cache.get(i);
   const pdf = R.pdf;
   const page = await pdf.getPage(i);
   const vp = page.getViewport({ scale: 1 });
   const tc = await page.getTextContent();
-  let text = "";
-  const runs = [];
-  let prev = null;
+  // 1. gather the text pieces into lines, with their position on the page
+  const lines = [];
+  let line = null;
   for (const it of tc.items) {
     if (typeof it.str !== "string") continue;
     const tx = pdfjsLib.Util.transform(vp.transform, it.transform);
     const fh = Math.hypot(tx[2], tx[3]) || 10;
     if (it.str) {
-      // glue items on the same line with a space when the PDF left a visual gap but no space character
-      if (prev && Math.abs(tx[5] - prev.base) < fh * 0.4 && tx[4] - prev.right > fh * 0.18 && !/\s$/.test(text) && !/^\s/.test(it.str)) text += " ";
-      else if (prev && Math.abs(tx[5] - prev.base) >= fh * 0.4 && text && !/\s$/.test(text)) text += " ";
+      if (line && Math.abs(tx[5] - line.base) >= fh * 0.4) line = null; // moved to another line without saying so
+      if (!line) lines.push((line = { base: tx[5], items: [] }));
+      line.items.push({ str: unspace(it.str), x: tx[4], right: tx[4] + it.width, w: it.width, y: tx[5], fh });
+    }
+    if (it.hasEOL) line = null;
+  }
+  // 2. join each line. A PDF often leaves a gap instead of a space character, so a gap means a space — but
+  //    letter-spaced text (headings, tightly justified lines) puts a gap between every letter. On such a line
+  //    the usual gap is the letter spacing, and only a clearly wider one is a word break.
+  let text = "";
+  const runs = [];
+  const widest = Math.max(1, ...lines.map((l) => l.items[l.items.length - 1].right - l.items[0].x));
+  let prevLn = null;
+  for (const ln of lines) {
+    const its = ln.items;
+    // a heading (different size, or a short line with no closing punctuation before a capital) ends a sentence,
+    // so it gets a pause instead of running into the paragraph below
+    if (prevLn && text && !/[.!?…:;,]["'”’)\]]*\s*$/.test(text)) {
+      const pfh = prevLn.items[0].fh, short = prevLn.items[prevLn.items.length - 1].right - prevLn.items[0].x < widest * 0.6;
+      if (Math.abs(its[0].fh - pfh) / pfh > 0.15 || (short && /^\s*[\p{Lu}\d“"]/u.test(its[0].str))) text = text.replace(/\s*$/, ". ");
+    }
+    prevLn = ln;
+    const gaps = [];
+    for (let k = 1; k < its.length; k++) gaps.push(its[k].x - its[k - 1].right);
+    const fh = its[0].fh;
+    let thr = fh * 0.18;
+    const tiny = its.filter((x) => x.str.trim().length <= 2).length;
+    if (its.length >= 4 && tiny / its.length >= 0.6) {
+      const g = gaps.filter((x) => x > 0).sort((a, b) => a - b);
+      const median = g.length ? g[g.length >> 1] : 0;
+      thr = Math.max(thr, median * 1.6 + fh * 0.04);
+    }
+    if (text && !/\s$/.test(text)) text += " ";
+    its.forEach((it, k) => {
+      if (k && gaps[k - 1] > thr && !/\s$/.test(text) && !/^\s/.test(it.str)) text += " ";
       const start = text.length;
       text += it.str;
       runs.push({
         start, end: text.length,
-        x: tx[4] / vp.width, y: (tx[5] - fh * 0.86) / vp.height,
-        w: it.width / vp.width, h: (fh * 1.12) / vp.height,
+        x: it.x / vp.width, y: (it.y - it.fh * 0.86) / vp.height,
+        w: it.w / vp.width, h: (it.fh * 1.12) / vp.height,
       });
-      prev = { base: tx[5], right: tx[4] + it.width };
-    }
-    if (it.hasEOL) {
-      if (/\p{L}[-‐]$/u.test(text)) text = text.slice(0, -1); // re-join a word hyphenated across lines
-      else if (text && !/\s$/.test(text)) text += " ";
-      prev = null;
-    }
+    });
+    if (/\p{L}[-‐]$/u.test(text)) { text = text.slice(0, -1); runs[runs.length - 1].end = text.length; } // re-join a word hyphenated across lines
   }
   const sents = [];
   for (const [a, b] of splitSentences(text)) {
