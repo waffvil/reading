@@ -158,6 +158,20 @@
         </div>
       </div>
       <div class="setting">
+        <div class="setting-label">Skip page edges when reading aloud</div>
+        <div class="seg" id="seg-skip">
+          <button data-v="off">Off</button>
+          <button data-v="top">Top</button>
+          <button data-v="both">Top &amp; bottom</button>
+        </div>
+        <div class="seg" id="seg-skipsize" style="margin-top:8px">
+          <button data-v="0.05">Small strip</button>
+          <button data-v="0.08">Medium</button>
+          <button data-v="0.12">Large</button>
+        </div>
+        <p class="setting-note">Leaves out running headers (the book or chapter title) and page numbers in a strip along the edge of each page. A full line of text there is still read.</p>
+      </div>
+      <div class="setting">
         <div class="setting-label">Margins</div>
         <div class="seg" id="seg-crop">
           <button data-v="0">Full page</button>

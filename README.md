@@ -13,13 +13,17 @@ A free, offline PDF reader for your phone. A home-screen app, hosted on GitHub P
   - **Natural** (recommended): lifelike voices that run on the phone itself. They **keep reading when you
     switch apps or lock the screen**, with lock-screen and headphone controls, like an audiobook. Tap ▶ next
     to any voice to hear a preview before downloading it; once downloaded it works offline.
-    - **Fast** (Piper): six voices, 63 MB each, downloaded one at a time. Light enough to play smoothly on a phone.
+    - **Fast** (Piper): sixteen American and British voices, 63 MB each, downloaded one at a time. Light enough
+      to play smoothly on a phone.
     - **Most natural** (Kokoro): seven voices sharing one 92 MB download. They sound the best but are heavy
       for a phone, so there may be pauses between sentences.
   - **Device voices:** the phone's built-in voices. Instant and free, but iOS stops them when Shelf leaves
     the screen. After downloading a better one (Settings → Accessibility → Spoken Content → Voices),
     fully close Shelf and reopen it; Premium/Enhanced voices are labelled. Apple doesn't give web apps
     Siri voices, and some downloaded voices may not appear either.
+
+  Running headers (book or chapter titles) and page numbers are skipped: Aa → "Skip page edges" sets top
+  and/or bottom and how big a strip, and shows the strip on the page when you change it.
 
   Scanned PDFs (images, no text layer) can't be read aloud.
 - **Reading comfort:** Light, Sepia and Dark themes; pinch to zoom; "Trim margins" makes small print
