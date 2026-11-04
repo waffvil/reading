@@ -961,7 +961,7 @@ const NV_VOICES = [
 ];
 // Bump with every change to voice-worker.js: it's stored with the voice for offline use, and the version in its
 // address is what makes a phone fetch the new one instead of running the stored copy forever.
-const NV_REV = 8;
+const NV_REV = 9;
 const NV_WORKER = `voice-worker.js?v=${NV_REV}`;
 const NV_FILES = [
   NV_WORKER, "vendor/ort/ort.wasm.min.mjs", "vendor/ort/ort-wasm-simd-threaded.mjs", "vendor/ort/ort-wasm-simd-threaded.wasm",
@@ -992,9 +992,9 @@ async function nvCheck() {
 }
 // How many CPU threads to try. Threads make the voice faster but need cross-origin isolation, and they can stall
 // on some phones, so a start that doesn't finish in time falls back to one thread and remembers that.
-// iPhone/iPad start on one thread: that's where the multi-threaded engine has been seen to stall.
-const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-const nvThreads = () => (self.crossOriginIsolated ? prefs.get("nvThreads", IOS ? 1 : Math.min(4, navigator.hardwareConcurrency || 2)) : 1);
+// Every phone tries several threads first. ("nvThreads2": a fresh setting, because the old one could have been
+// set to 1 by the Safari start-up crash, which had nothing to do with threads.)
+const nvThreads = () => (self.crossOriginIsolated ? prefs.get("nvThreads2", Math.min(4, navigator.hardwareConcurrency || 2)) : 1);
 const STAGES = { starting: "starting", download: "downloading the voice", load: "loading the voice", engine: "starting the voice engine", test: "a test sentence", ready: "ready" };
 function nvWorker() {
   if (NV.worker) return NV.worker;
@@ -1065,7 +1065,7 @@ function nvStalled(what) {
   console.warn("voice stalled:", what, NV.stage, "threads", nvThreads());
   if (nvThreads() > 1) {
     // most likely the multi-threaded engine; quietly start again on one thread
-    prefs.set("nvThreads", 1);
+    prefs.set("nvThreads2", 1);
     nvRestart();
     toast("Restarting the voice in a simpler mode…", 3000);
     NV.readyRetry?.(); // a start-up still in progress carries on with the new worker…
@@ -1075,6 +1075,15 @@ function nvStalled(what) {
   nvFailed(new Error(`it stopped responding (during ${what}, at: ${STAGES[NV.stage] || NV.stage})`));
 }
 function nvFailed(e) {
+  // a start-up error with several threads: try once more on one thread before giving up
+  if (nvThreads() > 1 && NV.ready && NV.stage !== "ready") {
+    console.warn("voice failed with threads, retrying on one:", e.message);
+    prefs.set("nvThreads2", 1);
+    nvRestart();
+    NV.readyRetry?.();
+    nvPump();
+    return;
+  }
   nvRestart();
   NV.lastError = e.message;
   NV.readyReject?.(e);
@@ -1103,7 +1112,8 @@ function nvStatus() {
       ? NV.speed >= 1.1 ? ` · speaks ${NV.speed.toFixed(1)}× faster than it reads` : ` · slower than real time (${NV.speed.toFixed(1)}×), so expect short pauses`
       : "")
     : NV.worker && NV.stage !== "download" ? `Getting ready: ${STAGES[NV.stage] || NV.stage}…` : "";
-  el.hidden = !el.textContent;
+  el.textContent = (el.textContent ? el.textContent + " · " : "") + `version ${NV_REV}`;
+  el.hidden = false;
 }
 async function nvDownload() {
   if (NV.downloading) return;
@@ -1261,12 +1271,15 @@ function splitSentences(text) {
     else out.push([...c]);
   }
   const final = [];
+  // long sentences are read in pieces of at most ~160 characters, broken at a comma or semicolon where possible:
+  // the natural voice makes each piece in one go, so shorter pieces mean sound starts sooner
+  const MAX = 160;
   for (let [a, b] of out) {
-    while (b - a > 280) {
-      const seg = text.slice(a, a + 280);
-      let k = Math.max(seg.lastIndexOf("; "), seg.lastIndexOf(", "), seg.lastIndexOf(": "));
-      if (k < 80) k = seg.lastIndexOf(" ");
-      if (k < 40) k = 280;
+    while (b - a > MAX + 40) {
+      const seg = text.slice(a, a + MAX);
+      let k = Math.max(seg.lastIndexOf("; "), seg.lastIndexOf(", "), seg.lastIndexOf(": "), seg.lastIndexOf(" — "));
+      if (k < 50) k = seg.lastIndexOf(" ");
+      if (k < 30) k = MAX;
       final.push([a, a + k + 1]);
       a += k + 1;
     }
