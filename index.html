@@ -136,8 +136,24 @@
       </div>
       <div class="setting">
         <div class="setting-label">Read-aloud voice</div>
-        <select id="voice-select" class="select" aria-label="Read-aloud voice"></select>
-        <p class="setting-note">For a more natural voice on iPhone: Settings → Accessibility → Spoken Content → Voices → English, and download an <b>Enhanced</b> or <b>Premium</b> voice. It then appears here and works offline.</p>
+        <div class="seg" id="seg-engine">
+          <button data-v="natural">Natural</button>
+          <button data-v="system">Device voices</button>
+        </div>
+
+        <div id="nv-box">
+          <p class="setting-note" id="nv-note">A lifelike voice that runs on your phone. <b>Keeps reading when you switch apps or lock the screen</b>, like an audiobook. One-time download, then it works offline.</p>
+          <button class="row-btn" id="nv-download">Download natural voice · 92 MB</button>
+          <div class="progress" id="nv-progress" hidden><i style="width:0"></i></div>
+          <select id="nv-voice" class="select" aria-label="Natural voice" hidden></select>
+          <button class="link-btn" id="nv-remove" hidden>Remove download (frees 92 MB)</button>
+        </div>
+
+        <div id="sys-box" hidden>
+          <select id="voice-select" class="select" aria-label="Device voice"></select>
+          <p class="setting-note">Device voices stop when you leave Shelf or lock the screen; use <b>Natural</b> to keep listening.</p>
+          <p class="setting-note">Downloaded a better voice (Settings → Accessibility → Spoken Content → Voices)? <b>Fully close Shelf</b> (swipe it away in the app switcher) and reopen it, then pick the one marked Premium or Enhanced. Apple doesn't give web apps every voice: Siri voices never appear here, and some downloaded voices may not either.</p>
+        </div>
       </div>
       <div class="setting">
         <div class="setting-label">Margins</div>

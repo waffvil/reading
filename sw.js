@@ -1,6 +1,7 @@
 // Shelf service worker. Everything the app needs is stored at install, so it opens with no network.
 // Books themselves live in IndexedDB (see app.js), not here. Bump VERSION on every deploy.
-const VERSION = "shelf-v2"; // v2: read aloud
+// The natural voice (model + its runtime) lives in its own cache, "shelf-voice", which survives updates.
+const VERSION = "shelf-v3"; // v2: read aloud · v3: natural voice
 importScripts("precache.js");
 
 self.addEventListener("install", (e) => {
@@ -14,10 +15,22 @@ self.addEventListener("install", (e) => {
 self.addEventListener("activate", (e) => {
   e.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== VERSION).map((k) => caches.delete(k))))
+      .then((keys) => Promise.all(keys.filter((k) => k !== VERSION && k !== "shelf-voice").map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
+
+// Cross-origin isolation lets the voice model use several CPU cores (SharedArrayBuffer). GitHub Pages can't
+// send these headers itself, so the worker adds them to everything it serves. Cross-origin fetches the app
+// makes (the voice download) use CORS, which isolation allows.
+function isolate(res) {
+  if (!res || res.type === "opaque" || res.status === 0) return res;
+  const h = new Headers(res.headers);
+  h.set("Cross-Origin-Opener-Policy", "same-origin");
+  h.set("Cross-Origin-Embedder-Policy", "require-corp");
+  h.set("Cross-Origin-Resource-Policy", "same-origin");
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+}
 
 self.addEventListener("fetch", (e) => {
   const req = e.request;
@@ -26,6 +39,12 @@ self.addEventListener("fetch", (e) => {
 
   // hosted PDFs go straight to the network — the app copies them into IndexedDB itself
   if (url.pathname.includes("/books/") && url.pathname.endsWith(".pdf")) return;
+
+  // the natural voice's code: from its own cache once downloaded (no copy in the app cache, no re-checks)
+  if (/\/(voice-worker\.js|vendor\/(ort|phonemizer|kokoro)\/)/.test(url.pathname)) {
+    e.respondWith(caches.open("shelf-voice").then((c) => c.match(req, { ignoreSearch: true })).then((hit) => (hit ? isolate(hit) : fetch(req).then(isolate))));
+    return;
+  }
 
   // the hosted-book list: fresh when online, last copy when not
   if (url.pathname.endsWith("/books/library.json")) {
@@ -51,8 +70,8 @@ self.addEventListener("fetch", (e) => {
           }
           return res;
         });
-      if (hit) { e.waitUntil(net.catch(() => {})); return hit; }
-      return net.catch(() => caches.match("./index.html"));
+      if (hit) { e.waitUntil(net.catch(() => {})); return isolate(hit); }
+      return net.then(isolate).catch(() => caches.match("./index.html").then(isolate));
     })
   );
 });

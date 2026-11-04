@@ -864,6 +864,8 @@ $("#btn-settings").addEventListener("click", () => {
   markSeg("#seg-theme", prefs.get("theme", "auto"));
   markSeg("#seg-zoom", R.zoom);
   markSeg("#seg-crop", R.crop);
+  refreshVoices();
+  renderVoiceUI();
   openSheet($("#settings"));
 });
 $("#seg-theme").addEventListener("click", (e) => {
@@ -887,9 +889,13 @@ $("#seg-crop").addEventListener("click", (e) => {
 });
 
 // ================================================================ LISTEN (text-to-speech)
-// Uses the voices built into the device (Web Speech API): free, and on iPhone fully offline.
-// Text comes from pdf.js page by page; it is spoken one sentence at a time, because long utterances
-// get cut off (Chrome) or stall (iOS), and sentence-sized steps give clean skip / highlight / resume.
+// Two engines read the same sentences:
+//  • "natural": the Kokoro voice model running on the phone (voice-worker.js). Its audio plays through an
+//    <audio> element, so it carries on in the background and shows up on the lock screen like an audiobook.
+//  • "system": the voices built into the device (Web Speech API). Free and instant, but iOS stops it as soon
+//    as Shelf isn't on screen.
+// Text comes from pdf.js page by page and is read one sentence at a time, which gives clean skip / highlight /
+// resume (and long utterances get cut off in Chrome or stall on iOS).
 const synth = window.speechSynthesis;
 const RATES = [0.8, 1, 1.15, 1.3, 1.5, 1.75, 2];
 const NOVELTY = /^(albert|bad news|bahh|bells|boing|bubbles|cellos|good news|jester|organ|superstar|trinoids|whisper|wobble|zarvox|fred|junior|ralph|kathy|eddy|flo|grandma|grandpa|reed|rocko|sandy|shelley)\b/i;
@@ -897,18 +903,22 @@ const T = {
   playing: false, bookId: null, page: 0, sents: [], idx: 0, gen: 0, cache: new Map(),
   userScrollAt: 0, progScrollUntil: 0, wake: null, voices: [], started: false, hlPage: 0,
 };
+const engine = () => (prefs.get("engine", "system") === "natural" && NV.downloaded ? "natural" : "system");
 
+// ---- device voices
+// iOS names a voice the same whatever its quality ("Ava"); only the voiceURI says which one is Premium/Enhanced.
+const quality = (v) => (/premium/i.test(v.voiceURI + v.name) ? "Premium" : /enhanced/i.test(v.voiceURI + v.name) ? "Enhanced" : /siri/i.test(v.voiceURI + v.name) ? "Siri" : "");
 function loadVoices() {
   if (!synth) return;
   const lang = (navigator.language || "en").slice(0, 2).toLowerCase();
   const score = (v) => {
-    const l = v.lang.toLowerCase();
+    const l = v.lang.toLowerCase(), q = quality(v);
     let s = 0;
     if (l.startsWith(lang)) s += 100;
     if (l.startsWith("en")) s += 50;
     if (v.localService) s += 20;
-    if (/premium|enhanced|natural|neural/i.test(v.name)) s += 15;
-    if (/siri/i.test(v.name)) s += 10;
+    if (q === "Premium") s += 30; else if (q === "Enhanced") s += 20; else if (q) s += 10;
+    if (/natural|neural/i.test(v.name)) s += 15;
     if (v.default) s += 5;
     if (NOVELTY.test(v.name)) s -= 80;
     return s;
@@ -927,13 +937,217 @@ function renderVoiceSelect() {
   const list = T.voices.filter((v) => !NOVELTY.test(v.name) && (v.lang.toLowerCase().startsWith(lang) || v.lang.toLowerCase().startsWith("en")));
   const cur = currentVoice();
   sel.innerHTML = list.length
-    ? list.map((v) => `<option value="${esc(v.voiceURI)}"${v === cur ? " selected" : ""}>${esc(v.name)} (${esc(v.lang)})${v.localService ? "" : " · online only"}</option>`).join("")
+    ? list.map((v) => { const q = quality(v); return `<option value="${esc(v.voiceURI)}"${v === cur ? " selected" : ""}>${esc(v.name)}${q && !v.name.includes(q) ? " · " + q : ""} (${esc(v.lang)})${v.localService ? "" : " · online only"}</option>`; }).join("")
     : `<option value="">No voices on this device</option>`;
 }
-if (synth) {
+// iOS often hands back an empty list at first and doesn't always fire "voiceschanged", so ask again a few times
+function refreshVoices() {
+  if (!synth) return;
   loadVoices();
+  let n = 0;
+  const again = () => { loadVoices(); if (!T.voices.length && ++n < 10) setTimeout(again, 400); };
+  setTimeout(again, 250);
+}
+if (synth) {
+  refreshVoices();
   synth.addEventListener?.("voiceschanged", loadVoices);
 }
+
+// ---- natural voice (Kokoro, on-device)
+const NV_VOICES = [
+  ["af_heart", "Heart · US, warm"], ["af_bella", "Bella · US, bright"], ["af_nicole", "Nicole · US, soft"],
+  ["am_michael", "Michael · US, male"], ["am_fenrir", "Fenrir · US, male, deep"],
+  ["bf_emma", "Emma · British"], ["bm_george", "George · British, male"],
+];
+const NV_FILES = [
+  "voice-worker.js", "vendor/ort/ort.wasm.min.mjs", "vendor/ort/ort-wasm-simd-threaded.mjs", "vendor/ort/ort-wasm-simd-threaded.wasm",
+  "vendor/phonemizer/phonemizer.js", "vendor/kokoro/vocab.json", ...NV_VOICES.map(([v]) => `vendor/kokoro/voices/${v}.bin`),
+];
+const NV_MODEL = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx";
+const SILENCE = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAwF0AAIC7AAACABAAZGF0YQQAAAAAAAAA";
+const NV = {
+  worker: null, downloaded: false, downloading: false, ready: null,
+  clips: new Map(),   // key → { text, url, promise, resolve, reject, sent }
+  want: [],           // keys to have ready, in reading order
+  busy: null,         // key the worker is synthesizing
+  audio: new Audio(), playingKey: null, playingGen: -1,
+};
+NV.audio.preload = "auto";
+NV.audio.setAttribute("playsinline", "");
+const nvVoice = () => { const v = prefs.get("nvVoice", "af_heart"); return NV_VOICES.some(([k]) => k === v) ? v : "af_heart"; };
+const nvKey = (page, idx) => `${T.bookId}|${nvVoice()}|${page}|${idx}`;
+
+async function nvCheck() {
+  try { NV.downloaded = !!(await (await caches.open("shelf-voice")).match(NV_MODEL)); } catch { NV.downloaded = false; }
+  renderVoiceUI();
+}
+function nvWorker() {
+  if (NV.worker) return NV.worker;
+  const w = (NV.worker = new Worker("voice-worker.js", { type: "module" }));
+  w.onmessage = ({ data: m }) => {
+    if (m.type === "progress") {
+      const bar = $("#nv-progress i");
+      if (bar) bar.style.width = Math.round((m.loaded / m.total) * 100) + "%";
+      $("#nv-download").textContent = `Downloading… ${Math.round(m.loaded / 1e6)} of ${Math.round(m.total / 1e6)} MB`;
+    } else if (m.type === "ready") {
+      NV.readyResolve?.();
+    } else if (m.type === "audio") {
+      const c = NV.clips.get(m.id);
+      NV.busy = null;
+      if (c) { c.url = URL.createObjectURL(wavBlob(m.pcm, m.rate)); c.dur = m.pcm.length / m.rate; c.resolve(c.url); }
+      nvPump();
+    } else if (m.type === "error") {
+      console.warn("voice", m.message);
+      if (m.id) {
+        const c = NV.clips.get(m.id);
+        NV.busy = null;
+        if (c) { NV.clips.delete(m.id); c.reject(new Error(m.message)); }
+        nvPump();
+      } else NV.readyReject?.(new Error(m.message));
+    } else if (m.type === "removed") {
+      NV.removedResolve?.();
+    }
+  };
+  w.onerror = (e) => { console.warn("voice worker", e.message); NV.readyReject?.(new Error(e.message || "The voice couldn't start")); };
+  return w;
+}
+// start the model (downloading it first if needed); resolves once it can speak
+function nvReady() {
+  if (!NV.ready) {
+    NV.ready = new Promise((res, rej) => { NV.readyResolve = res; NV.readyReject = rej; });
+    NV.ready.catch(() => { NV.ready = null; });
+    nvWorker().postMessage({ type: "load" });
+  }
+  return NV.ready;
+}
+async function nvDownload() {
+  if (NV.downloading) return;
+  NV.downloading = true;
+  renderVoiceUI();
+  try {
+    // keep the voice's own code with it, so it works offline even before the next app update
+    caches.open("shelf-voice").then((c) => c.addAll(NV_FILES)).catch((e) => console.warn("voice files", e));
+    await nvReady();
+    NV.downloaded = true;
+    prefs.set("engine", "natural");
+    toast("Natural voice ready — it works offline now");
+  } catch (e) {
+    toast(navigator.onLine ? "Download failed: " + e.message : "You're offline — connect to download the voice", 4500);
+  }
+  NV.downloading = false;
+  renderVoiceUI();
+}
+async function nvRemove() {
+  if (T.playing && engine() === "natural") ttsStop();
+  const done = new Promise((res) => (NV.removedResolve = res));
+  nvWorker().postMessage({ type: "remove" });
+  await Promise.race([done, new Promise((r) => setTimeout(r, 3000))]);
+  try { await caches.delete("shelf-voice"); } catch {}
+  NV.worker?.terminate();
+  NV.worker = null; NV.ready = null; NV.downloaded = false;
+  nvClear();
+  prefs.set("engine", "system");
+  renderVoiceUI();
+  renderStorage?.();
+}
+function wavBlob(pcm, rate) {
+  const b = new DataView(new ArrayBuffer(44 + pcm.length * 2));
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) b.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); b.setUint32(4, 36 + pcm.length * 2, true); str(8, "WAVEfmt ");
+  b.setUint32(16, 16, true); b.setUint16(20, 1, true); b.setUint16(22, 1, true);
+  b.setUint32(24, rate, true); b.setUint32(28, rate * 2, true); b.setUint16(32, 2, true); b.setUint16(34, 16, true);
+  str(36, "data"); b.setUint32(40, pcm.length * 2, true);
+  for (let i = 0; i < pcm.length; i++) b.setInt16(44 + i * 2, Math.max(-1, Math.min(1, pcm[i])) * 0x7fff, true);
+  return new Blob([b], { type: "audio/wav" });
+}
+function nvClip(key, text) {
+  let c = NV.clips.get(key);
+  if (!c) {
+    c = { text };
+    c.promise = new Promise((res, rej) => { c.resolve = res; c.reject = rej; });
+    c.promise.catch(() => {});
+    NV.clips.set(key, c);
+  }
+  return c;
+}
+// hand the worker the next sentence that's wanted and not made yet (one at a time, so a skip never waits behind stale work)
+function nvPump() {
+  if (NV.busy) return;
+  const key = NV.want.find((k) => { const c = NV.clips.get(k); return c && !c.sent; });
+  if (!key) return;
+  const c = NV.clips.get(key);
+  c.sent = true;
+  NV.busy = key;
+  nvReady().then(() => nvWorker().postMessage({ type: "speak", id: key, text: c.text, voice: key.split("|")[1] }), (e) => {
+    NV.busy = null;
+    for (const [k, x] of NV.clips) if (!x.url) { NV.clips.delete(k); x.reject(e); }
+  });
+}
+// queue the current sentence and the next ~minute of reading; drop audio that's no longer needed
+async function nvPlan() {
+  const want = [];
+  let page = T.page, idx = T.idx, sents = T.sents, chars = 0, pages = 0;
+  const bookId = T.bookId;
+  while (want.length < 10 && chars < 1100) {
+    if (idx >= sents.length) {
+      if (page >= R.book.pages || ++pages > 4) break;
+      page++; idx = 0;
+      sents = await sentencesFor(page);
+      if (bookId !== T.bookId || !R.book) return;
+      continue;
+    }
+    const key = nvKey(page, idx);
+    nvClip(key, sents[idx].text);
+    want.push(key);
+    chars += sents[idx].text.length;
+    idx++;
+  }
+  NV.want = want;
+  const keep = new Set(want);
+  for (const [k, c] of NV.clips) {
+    if (keep.has(k) || k === NV.playingKey || k === NV.busy) continue;
+    if (c.url) URL.revokeObjectURL(c.url);
+    else c.reject(new Error("skipped"));
+    NV.clips.delete(k);
+  }
+  nvPump();
+}
+function nvClear() {
+  for (const c of NV.clips.values()) { if (c.url) URL.revokeObjectURL(c.url); else c.reject(new Error("cleared")); }
+  NV.clips.clear();
+  NV.want = [];
+  NV.playingKey = null;
+  NV.audio.removeAttribute("src");
+}
+NV.audio.addEventListener("ended", () => {
+  if (T.playing && NV.playingGen === T.gen && engine() === "natural") advance();
+});
+NV.audio.addEventListener("pause", () => {
+  // paused from outside the app (headphones out, a call, Control Center): reflect it
+  if (T.playing && NV.playingGen === T.gen && !NV.audio.ended && NV.audio.currentTime > 0 && engine() === "natural") {
+    T.playing = false; T.gen++; releaseWake(); updatePlayer();
+  }
+});
+NV.audio.addEventListener("error", () => {
+  if (T.playing && NV.playingGen === T.gen && engine() === "natural" && NV.audio.getAttribute("src")) { console.warn("audio", NV.audio.error); advance(); }
+});
+
+function renderVoiceUI() {
+  const eng = prefs.get("engine", "system") === "natural" ? "natural" : "system";
+  markSeg("#seg-engine", eng);
+  $("#nv-box").hidden = eng !== "natural";
+  $("#sys-box").hidden = eng !== "system";
+  const dl = $("#nv-download");
+  dl.hidden = NV.downloaded;
+  dl.disabled = NV.downloading;
+  if (!NV.downloading) dl.textContent = "Download natural voice · 92 MB";
+  $("#nv-progress").hidden = !NV.downloading;
+  if (!NV.downloading) $("#nv-progress i").style.width = "0";
+  $("#nv-voice").hidden = !NV.downloaded;
+  $("#nv-remove").hidden = !NV.downloaded;
+  $("#nv-voice").innerHTML = NV_VOICES.map(([k, label]) => `<option value="${k}"${k === nvVoice() ? " selected" : ""}>${esc(label)}</option>`).join("");
+}
+nvCheck();
 
 // ---- text → sentences, each with highlight boxes in page fractions
 const ABBR = /^(mr|mrs|ms|dr|st|vs|etc|cf|fig|figs|no|vol|pp|p|e\.g|i\.e|inc|ltd|jr|sr|prof|ch|eq|approx)$/i;
@@ -1063,6 +1277,7 @@ function drawTts(s) {
 
 // ---- playback
 function speakCurrent(retry = false) {
+  if (engine() === "natural") return nvSpeakCurrent();
   const s = T.sents[T.idx];
   if (!s) return;
   const gen = ++T.gen;
@@ -1096,6 +1311,40 @@ function speakCurrent(retry = false) {
   updatePlayer();
 }
 
+async function nvSpeakCurrent() {
+  const s = T.sents[T.idx];
+  if (!s) return;
+  const gen = ++T.gen;
+  const key = nvKey(T.page, T.idx);
+  const c = nvClip(key, s.text);
+  drawTts(s);
+  follow(s);
+  nvPlan();
+  setBuffering(!c.url);
+  updatePlayer();
+  let url;
+  try { url = await c.promise; } catch (e) {
+    if (gen !== T.gen || !T.playing) return;
+    ttsPause();
+    toast("Couldn't read this aloud: " + e.message, 4500);
+    return;
+  }
+  if (gen !== T.gen || !T.playing) return;
+  setBuffering(false);
+  const a = NV.audio;
+  NV.playingKey = key;
+  NV.playingGen = gen;
+  a.src = url;
+  a.playbackRate = prefs.get("rate", 1);
+  a.play().catch((e) => {
+    if (gen !== T.gen) return;
+    console.warn("play", e);
+    ttsPause();
+    toast("Tap play to keep listening");
+  });
+}
+function setBuffering(on) { $("#player").classList.toggle("buffering", on && T.playing); }
+
 async function advance() {
   T.idx++;
   let empties = 0;
@@ -1113,9 +1362,27 @@ async function advance() {
 }
 
 async function ttsPlay() {
-  if (!synth) return toast("This browser can't read aloud");
-  // iOS only lets speech start inside a tap: speak a silent blip now, before any await
-  try { const w = new SpeechSynthesisUtterance(" "); w.volume = 0; synth.speak(w); } catch {}
+  const natural = engine() === "natural";
+  if (!natural && !synth) return toast("This browser can't read aloud");
+  // iOS only lets sound start inside a tap, so wake the right engine now, before any await
+  if (natural) {
+    const a = NV.audio;
+    if (NV.playingKey && NV.playingKey === nvKey(T.page, T.idx) && a.getAttribute("src") && !a.ended && T.bookId === R.book.id) {
+      T.playing = true;
+      NV.playingGen = ++T.gen;
+      a.playbackRate = prefs.get("rate", 1);
+      a.play().catch(() => {});
+      $("#player").hidden = false;
+      acquireWake();
+      updatePlayer();
+      drawTts(T.sents[T.idx]);
+      nvPlan();
+      return;
+    }
+    try { a.src = SILENCE; a.play().catch(() => {}); } catch {}
+  } else {
+    try { const w = new SpeechSynthesisUtterance(" "); w.volume = 0; synth.speak(w); } catch {}
+  }
   T.playing = true;
   $("#player").hidden = false;
   updatePlayer();
@@ -1123,6 +1390,7 @@ async function ttsPlay() {
   const gen = ++T.gen;
   const resume = T.bookId === R.book.id && T.sents[T.idx] && onScreen(T.page, T.sents[T.idx]);
   if (resume) return speakCurrent();
+  if (T.bookId !== R.book.id) nvClear();
   T.bookId = R.book.id;
   const v = viewFrac();
   const sents = await sentencesFor(v.page);
@@ -1138,12 +1406,15 @@ function ttsPause() {
   T.playing = false;
   T.gen++;
   try { synth?.cancel(); } catch {}
+  try { NV.audio.pause(); } catch {}
+  setBuffering(false);
   releaseWake();
   updatePlayer();
 }
 function ttsStop() {
   ttsPause();
   drawTts(null);
+  nvClear();
   $("#player").hidden = true;
 }
 async function ttsSkip(dir) {
@@ -1157,7 +1428,7 @@ async function ttsSkip(dir) {
     else if (T.page > 1) { T.page--; T.sents = await sentencesFor(T.page); T.idx = Math.max(0, T.sents.length - 1); }
   }
   if (T.playing) speakCurrent();
-  else { drawTts(T.sents[T.idx]); follow(T.sents[T.idx], true); }
+  else { NV.playingKey = null; drawTts(T.sents[T.idx]); follow(T.sents[T.idx], true); }
 }
 function updatePlayer() {
   const btn = $("#tts-play");
@@ -1170,7 +1441,10 @@ function updatePlayer() {
   if ("mediaSession" in navigator) {
     try {
       navigator.mediaSession.playbackState = T.playing ? "playing" : "paused";
-      if (R.book) navigator.mediaSession.metadata = new MediaMetadata({ title: R.book.title, artist: R.book.author || "Shelf", album: `Page ${T.page || 1}` });
+      if (R.book) navigator.mediaSession.metadata = new MediaMetadata({
+        title: R.book.title, artist: R.book.author || "Shelf", album: `Page ${T.page || 1} of ${R.book.pages}`,
+        artwork: [{ src: "icon-192.png", sizes: "192x192", type: "image/png" }],
+      });
     } catch {}
   }
 }
@@ -1187,7 +1461,8 @@ $("#tts-rate").addEventListener("click", () => {
   const next = RATES[(RATES.indexOf(r) + 1) % RATES.length] || 1;
   prefs.set("rate", next);
   updatePlayer();
-  if (T.playing) speakCurrent();
+  if (engine() === "natural") NV.audio.playbackRate = next;
+  else if (T.playing) speakCurrent();
 });
 $("#voice-select").addEventListener("change", (e) => {
   prefs.set("voice", e.target.value);
@@ -1201,6 +1476,35 @@ $("#voice-select").addEventListener("change", (e) => {
     synth.speak(u);
   } catch {}
 });
+$("#seg-engine").addEventListener("click", (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  const was = engine();
+  if (T.playing) ttsPause();
+  prefs.set("engine", b.dataset.v);
+  if (b.dataset.v === "system") refreshVoices();
+  if (was !== engine()) nvClear();
+  renderVoiceUI();
+});
+$("#nv-download").addEventListener("click", nvDownload);
+$("#nv-remove").addEventListener("click", () => { if (confirm("Remove the natural voice from this device? You can download it again later.")) nvRemove(); });
+$("#nv-voice").addEventListener("change", async (e) => {
+  prefs.set("nvVoice", e.target.value);
+  const playing = T.playing;
+  if (playing) ttsPause();
+  nvClear();
+  if (playing) return ttsPlay();
+  // a short sample, so you can hear the voice you picked
+  try {
+    const a = NV.audio;
+    a.src = SILENCE; a.play().catch(() => {});
+    const key = `sample|${nvVoice()}|0|0`;
+    const c = nvClip(key, "This is how I'll read your book.");
+    NV.want = [key]; nvPump();
+    const url = await c.promise;
+    if (T.playing) return;
+    a.src = url; a.playbackRate = 1; a.play().catch(() => {});
+  } catch {}
+});
 if ("mediaSession" in navigator) {
   try {
     navigator.mediaSession.setActionHandler("play", () => R.book && ttsPlay());
@@ -1210,13 +1514,16 @@ if ("mediaSession" in navigator) {
   } catch {}
 }
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden || !T.playing) return;
+  if (document.hidden) return;
+  refreshVoices(); // a voice downloaded in iOS Settings while we were away
+  if (!T.playing) return;
   acquireWake();
+  if (engine() === "natural") { drawTts(T.sents[T.idx]); follow(T.sents[T.idx]); return; } // kept playing while away
   if (!synth.speaking && !synth.pending) speakCurrent(); // the OS paused us while away — pick the sentence back up
 });
 // safety net: some engines finish an utterance without ever firing "end"
 setInterval(() => {
-  if (T.playing && T.started && !document.hidden && !synth.speaking && !synth.pending) { T.started = false; advance(); }
+  if (engine() === "system" && T.playing && T.started && !document.hidden && !synth.speaking && !synth.pending) { T.started = false; advance(); }
 }, 1500);
 
 // ---------------------------------------------------------------- close
