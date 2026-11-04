@@ -864,6 +864,7 @@ $("#btn-settings").addEventListener("click", () => {
   markSeg("#seg-theme", prefs.get("theme", "auto"));
   markSeg("#seg-zoom", R.zoom);
   markSeg("#seg-crop", R.crop);
+  markSkip();
   refreshVoices();
   renderVoiceUI();
   openSheet($("#settings"));
@@ -880,6 +881,50 @@ $("#seg-zoom").addEventListener("click", (e) => {
   markSeg("#seg-zoom", R.zoom);
   relayout();
 });
+function markSkip() {
+  markSeg("#seg-skip", prefs.get("skipEdges", "both"));
+  markSeg("#seg-skipsize", prefs.get("skipSize", 0.08));
+  $("#seg-skipsize").hidden = prefs.get("skipEdges", "both") === "off";
+}
+// what's read aloud changed: forget the prepared text and audio, and start again from the screen next time
+function resetReading() {
+  if (T.playing) ttsPause();
+  drawTts(null);
+  T.cache.clear();
+  nvClear();
+  T.bookId = null;
+  T.sents = [];
+}
+// shade the strip that's skipped on the pages in view for a moment, so you can see what it covers
+function flashEdges() {
+  const skip = prefs.get("skipEdges", "both"), band = +prefs.get("skipSize", 0.08) * 100;
+  document.querySelectorAll(".edge-flash").forEach((x) => x.remove());
+  if (skip === "off" || !R.book) return;
+  // slide the settings sheet out of the way for a moment so the page underneath shows
+  const sheet = $("#settings");
+  sheet.classList.add("peek"); $("#scrim").classList.add("peek");
+  clearTimeout(flashEdges.t);
+  flashEdges.t = setTimeout(() => { sheet.classList.remove("peek"); $("#scrim").classList.remove("peek"); }, 1700);
+  for (const el of R.pageEls) {
+    const r = el.getBoundingClientRect();
+    if (r.bottom < 0 || r.top > innerHeight) continue;
+    const f = document.createElement("div");
+    f.className = "edge-flash";
+    f.innerHTML = `<i style="top:0;height:${band}%"></i>` + (skip === "both" ? `<i style="bottom:0;height:${band}%"></i>` : "");
+    el.querySelector(".page-inner").append(f);
+    setTimeout(() => f.classList.add("out"), 1400);
+    setTimeout(() => f.remove(), 2000);
+  }
+}
+for (const [sel, key] of [["#seg-skip", "skipEdges"], ["#seg-skipsize", "skipSize"]]) {
+  $(sel).addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    prefs.set(key, key === "skipSize" ? +b.dataset.v : b.dataset.v);
+    markSkip();
+    resetReading();
+    flashEdges();
+  });
+}
 $("#seg-crop").addEventListener("click", (e) => {
   const b = e.target.closest("button"); if (!b) return;
   R.crop = +b.dataset.v;
@@ -957,24 +1002,34 @@ if (synth) {
 // Two families. Piper voices are light, so they keep up with playback on a phone; each is its own download.
 // Kokoro voices sound the most natural but are heavy for a phone; all seven share one model download.
 const VOICES = [
-  { id: "en_US-lessac-medium", fam: "piper", name: "Lessac", desc: "US · female · clear" },
-  { id: "en_US-amy-medium", fam: "piper", name: "Amy", desc: "US · female" },
-  { id: "en_US-ryan-medium", fam: "piper", name: "Ryan", desc: "US · male" },
-  { id: "en_US-joe-medium", fam: "piper", name: "Joe", desc: "US · male · relaxed" },
+  { id: "en_US-lessac-medium", fam: "piper", name: "Lessac", desc: "American · female · clear" },
+  { id: "en_US-amy-medium", fam: "piper", name: "Amy", desc: "American · female" },
+  { id: "en_US-kristin-medium", fam: "piper", name: "Kristin", desc: "American · female · calm" },
+  { id: "en_US-hfc_female-medium", fam: "piper", name: "Hannah", desc: "American · female · bright" },
+  { id: "en_US-ljspeech-medium", fam: "piper", name: "Linda", desc: "American · female · audiobook" },
+  { id: "en_US-ryan-medium", fam: "piper", name: "Ryan", desc: "American · male" },
+  { id: "en_US-joe-medium", fam: "piper", name: "Joe", desc: "American · male · relaxed" },
+  { id: "en_US-john-medium", fam: "piper", name: "John", desc: "American · male · deep" },
+  { id: "en_US-bryce-medium", fam: "piper", name: "Bryce", desc: "American · male · young" },
+  { id: "en_US-norman-medium", fam: "piper", name: "Norman", desc: "American · male · older" },
+  { id: "en_US-hfc_male-medium", fam: "piper", name: "Henry", desc: "American · male · bright" },
+  { id: "en_GB-jenny_dioco-medium", fam: "piper", name: "Jenny", desc: "British · female" },
+  { id: "en_GB-cori-medium", fam: "piper", name: "Cori", desc: "British · female · soft" },
   { id: "en_GB-alba-medium", fam: "piper", name: "Alba", desc: "Scottish · female" },
-  { id: "en_GB-northern_english_male-medium", fam: "piper", name: "Northern English", desc: "British · male" },
-  { id: "af_heart", fam: "kokoro", name: "Heart", desc: "US · female · warm" },
-  { id: "af_bella", fam: "kokoro", name: "Bella", desc: "US · female · bright" },
-  { id: "af_nicole", fam: "kokoro", name: "Nicole", desc: "US · female · soft" },
-  { id: "am_michael", fam: "kokoro", name: "Michael", desc: "US · male" },
-  { id: "am_fenrir", fam: "kokoro", name: "Fenrir", desc: "US · male · deep" },
+  { id: "en_GB-alan-medium", fam: "piper", name: "Alan", desc: "British · male" },
+  { id: "en_GB-northern_english_male-medium", fam: "piper", name: "Northern English", desc: "British · male · northern" },
+  { id: "af_heart", fam: "kokoro", name: "Heart", desc: "American · female · warm" },
+  { id: "af_bella", fam: "kokoro", name: "Bella", desc: "American · female · bright" },
+  { id: "af_nicole", fam: "kokoro", name: "Nicole", desc: "American · female · soft" },
+  { id: "am_michael", fam: "kokoro", name: "Michael", desc: "American · male" },
+  { id: "am_fenrir", fam: "kokoro", name: "Fenrir", desc: "American · male · deep" },
   { id: "bf_emma", fam: "kokoro", name: "Emma", desc: "British · female" },
   { id: "bm_george", fam: "kokoro", name: "George", desc: "British · male" },
 ];
 const SIZE = { piper: "63 MB", kokoro: "92 MB, shared by all seven" };
 // Bump with every change to voice-worker.js or piper-worker.js: they're stored with the voices for offline use,
 // and the version in their address is what makes a phone fetch the new one instead of running a stored copy.
-const NV_REV = 10;
+const NV_REV = 11;
 const NV_WORKERS = { kokoro: `voice-worker.js?v=${NV_REV}`, piper: `piper-worker.js?v=${NV_REV}` };
 const NV_FILES = [
   ...Object.values(NV_WORKERS), "vendor/ort/ort.wasm.min.mjs", "vendor/ort/ort-wasm-simd-threaded.mjs", "vendor/ort/ort-wasm-simd-threaded.wasm",
@@ -1404,6 +1459,27 @@ async function sentencesFor(i) {
     }
     if (it.hasEOL) line = null;
   }
+  // 1b. leave out the running header (book or chapter title) and page number: header-like lines in a strip at the
+  //     top (and bottom) of the page — short, just a number, or in a different size from the body text.
+  //     A full line of body text in the strip is still read. Set in Aa → "Skip page edges".
+  const skip = prefs.get("skipEdges", "both"), band = +prefs.get("skipSize", 0.08);
+  if (skip !== "off" && lines.length > 1) {
+    const width = (l) => l.items[l.items.length - 1].right - l.items[0].x;
+    // the body text's size: the size most of the page's characters are in (counting pieces instead would let a
+    // letter-spaced header, which arrives as dozens of one-letter pieces, outvote the real text)
+    const sizes = lines.flatMap((l) => l.items.map((x) => [x.fh, x.str.length])).sort((a, b) => a[0] - b[0]);
+    let half = sizes.reduce((n, [, c]) => n + c, 0) / 2, body = sizes[0][0];
+    for (const [fh, c] of sizes) { body = fh; if ((half -= c) <= 0) break; }
+    const widest = Math.max(...lines.map(width));
+    const headerish = (l) => {
+      const t = l.items.map((x) => x.str).join("").trim();
+      return !t || /^[\divxlc\s.,\-–—|·•:]+$/i.test(t) || width(l) < widest * 0.75 || Math.abs(l.items[0].fh - body) / body > 0.12;
+    };
+    for (let k = lines.length - 1; k >= 0; k--) {
+      const l = lines[k], top = (l.base - l.items[0].fh) / vp.height, bottom = l.base / vp.height;
+      if ((top < band || (skip === "both" && bottom > 1 - band)) && headerish(l)) lines.splice(k, 1);
+    }
+  }
   // 2. join each line. A PDF often leaves a gap instead of a space character, so a gap means a space — but
   //    letter-spaced text (headings, tightly justified lines) puts a gap between every letter. On such a line
   //    the usual gap is the letter spacing, and only a clearly wider one is a word break.
@@ -1457,8 +1533,8 @@ async function sentencesFor(i) {
     if (!boxes.length) continue;
     sents.push({ text: t, boxes, top: Math.min(...boxes.map((x) => x.y)), bottom: Math.max(...boxes.map((x) => x.y + x.h)) });
   }
-  // drop running heads / footers: a short line hugging the top or bottom edge with no sentence ending
-  const edge = (s) => s.text.length < 60 && !/[.!?…]["'”’)]*$/.test(s.text) && (s.bottom < 0.1 || s.top > 0.9);
+  // drop running heads / footers that got past 1b: a short line hugging the edge with no sentence ending
+  const edge = (s) => skip !== "off" && s.text.length < 60 && !/[.!?…]["'”’)]*$/.test(s.text) && (s.bottom < 0.1 || (skip === "both" && s.top > 0.9));
   while (sents.length && edge(sents[0])) sents.shift();
   while (sents.length && edge(sents[sents.length - 1])) sents.pop();
   if (pdf === R.pdf) T.cache.set(i, sents);

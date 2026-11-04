@@ -324,3 +324,10 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
 .vrow .btn.small { flex: none; background: var(--surface); color: var(--accent); }
 .vrow .btn[disabled] { opacity: .45; }
 .link-btn.inline { display: inline; margin: 0; font-size: inherit; }
+.edge-flash { position: absolute; inset: 0; z-index: 3; pointer-events: none; transition: opacity .5s; }
+.edge-flash.out { opacity: 0; }
+.edge-flash i { position: absolute; left: 0; right: 0; background: rgb(225 90 60 / .22); border: 1px dashed rgb(225 90 60 / .7); }
+.sheet { transition: transform .3s ease; }
+.sheet.peek { transform: translateY(calc(100% - 96px)); }
+#scrim { transition: opacity .3s; }
+#scrim.peek { opacity: 0; }
