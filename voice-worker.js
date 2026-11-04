@@ -8,6 +8,7 @@
 // Messages out: {type:"progress", loaded, total}  {type:"stage", stage}  {type:"ready", threads}
 //               {type:"audio", id, pcm}  {type:"error", id?, message, stage}
 // "stage" says how far start-up got, so the app can tell a stall apart from a slow phone and say where it stuck.
+import "./vendor/stream-iterator.js"; // first: the phonemizer needs it while it loads (Safari)
 import * as ort from "./vendor/ort/ort.wasm.min.mjs";
 import { phonemize } from "./vendor/phonemizer/phonemizer.js";
 
