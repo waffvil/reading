@@ -10,9 +10,12 @@ A free, offline PDF reader for your phone. A home-screen app, hosted on GitHub P
 - **Read aloud (audiobook mode):** tap the headphones. It reads from the first line on screen, one
   sentence at a time, highlighting each sentence, following along and turning pages by itself. There's a
   player with back, play/pause, next and speed (0.8–2×). Two kinds of voice, picked in Aa:
-  - **Natural** (recommended): a lifelike voice (Kokoro) that runs on the phone itself. It **keeps reading
-    when you switch apps or lock the screen**, with lock-screen and headphone controls, like an audiobook.
-    One-time 92 MB download, then fully offline. Seven voices (US and British, female and male).
+  - **Natural** (recommended): lifelike voices that run on the phone itself. They **keep reading when you
+    switch apps or lock the screen**, with lock-screen and headphone controls, like an audiobook. Tap ▶ next
+    to any voice to hear a preview before downloading it; once downloaded it works offline.
+    - **Fast** (Piper): six voices, 63 MB each, downloaded one at a time. Light enough to play smoothly on a phone.
+    - **Most natural** (Kokoro): seven voices sharing one 92 MB download. They sound the best but are heavy
+      for a phone, so there may be pauses between sentences.
   - **Device voices:** the phone's built-in voices. Instant and free, but iOS stops them when Shelf leaves
     the screen. After downloading a better one (Settings → Accessibility → Spoken Content → Voices),
     fully close Shelf and reopen it; Premium/Enhanced voices are labelled. Apple doesn't give web apps
@@ -46,10 +49,12 @@ After changing any shipped file, bump `VERSION` in `sw.js` so phones pick up the
 `scripts/precache.sh` if you add files the app needs offline.
 
 ### Natural voice internals
-`voice-worker.js` runs [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (Apache-2.0, 8-bit ONNX
-build from `onnx-community/Kokoro-82M-v1.0-ONNX`) with ONNX Runtime Web (MIT, `vendor/ort/`). Text is
-turned into phonemes by `phonemizer` (`vendor/phonemizer/`, which bundles eSpeak NG, GPL-3.0). Voice style
-files are in `vendor/kokoro/voices/`. The model itself isn't in the repo: the app downloads it from Hugging
-Face on request and keeps it, with the files above, in the `shelf-voice` cache, which survives app updates.
-The service worker adds cross-origin isolation headers so the model can use several CPU cores.
-
+`voice-worker.js` runs [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (Apache-2.0, 8-bit ONNX build
+from `onnx-community/Kokoro-82M-v1.0-ONNX`); `piper-worker.js` runs [Piper](https://github.com/rhasspy/piper)
+voices (from `rhasspy/piper-voices`, each with its own license listed there). Both use ONNX Runtime Web (MIT,
+`vendor/ort/`) and turn text into phonemes with `phonemizer` (`vendor/phonemizer/`, which bundles eSpeak NG,
+GPL-3.0). `vendor/stream-iterator.js` adds a stream feature Safari lacks, which the phonemizer needs.
+Kokoro voice styles and preview clips are in `vendor/kokoro/`; Piper previews play from Hugging Face. Models
+aren't in the repo: the app downloads each on request and keeps it, with the code above, in the `shelf-voice`
+cache, which survives app updates. Bump `NV_REV` in `app.js` whenever a worker changes. The service worker adds
+cross-origin isolation headers so the models can use several CPU cores.
