@@ -13,10 +13,17 @@ A free, offline PDF reader for your phone. A home-screen app, hosted on GitHub P
   - **Natural** (recommended): lifelike voices that run on the phone itself. They **keep reading when you
     switch apps or lock the screen**, with lock-screen and headphone controls, like an audiobook. Tap ▶ next
     to any voice to hear a preview before downloading it; once downloaded it works offline.
-    - **Fast** (Piper): sixteen American and British voices, 63 MB each, downloaded one at a time. Light enough
-      to play smoothly on a phone.
-    - **Most natural** (Kokoro): seven voices sharing one 92 MB download. They sound the best but are heavy
-      for a phone, so there may be pauses between sentences.
+    - **Most natural** (Kokoro): eleven voices (nine American) sharing one download. Where the phone's graphics
+      chip can run it (WebGPU: iOS 26, recent Chrome), Kokoro runs there in full precision: a 326 MB download,
+      several times faster than speech, so it reads continuously and prepares minutes ahead. Elsewhere it runs
+      on the processor (92 MB) and may pause between sentences. Phones that already have the 92 MB version are
+      offered the faster one in Aa.
+    - **Fast** (Piper): sixteen American and British voices, 63 MB each, downloaded one at a time. Lighter, a
+      little less lifelike.
+
+    Natural voices read in **passages** of a few sentences at once, so the voice carries its rhythm from one
+    sentence into the next instead of starting cold each time; the highlight still moves sentence by sentence
+    (each sentence's start is found from the voice's phonemes and the pause in the audio).
   - **Device voices:** the phone's built-in voices. Instant and free, but iOS stops them when Shelf leaves
     the screen. After downloading a better one (Settings → Accessibility → Spoken Content → Voices),
     fully close Shelf and reopen it; Premium/Enhanced voices are labelled. Apple doesn't give web apps
@@ -53,8 +60,12 @@ After changing any shipped file, bump `VERSION` in `sw.js` so phones pick up the
 `scripts/precache.sh` if you add files the app needs offline.
 
 ### Natural voice internals
-`voice-worker.js` runs [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (Apache-2.0, 8-bit ONNX build
-from `onnx-community/Kokoro-82M-v1.0-ONNX`); `piper-worker.js` runs [Piper](https://github.com/rhasspy/piper)
+`voice-worker.js` runs [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (Apache-2.0, from
+`onnx-community/Kokoro-82M-v1.0-ONNX`): `model.onnx` on WebGPU (`vendor/ort-gpu/`, the ONNX Runtime WebGPU
+build), `model_quantized.onnx` on WebAssembly otherwise. Measured on WebGPU (Apple M2): the fp16, q4f16 and
+uint8 builds come out silent or NaN after ~2.7 s, and the 8-bit build falls back to the CPU, so only fp32 is
+used there; the worker's start-up test reads a whole sentence and checks speech reaches its end, and falls
+back to the processor if not. `piper-worker.js` runs [Piper](https://github.com/rhasspy/piper)
 voices (from `rhasspy/piper-voices`, each with its own license listed there). Both use ONNX Runtime Web (MIT,
 `vendor/ort/`) and turn text into phonemes with `phonemizer` (`vendor/phonemizer/`, which bundles eSpeak NG,
 GPL-3.0). `vendor/stream-iterator.js` adds a stream feature Safari lacks, which the phonemizer needs.

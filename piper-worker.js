@@ -1,9 +1,11 @@
 // Shelf fast natural voice: a Piper voice (VITS), run on the phone itself with ONNX Runtime (WebAssembly).
 // Several times lighter than Kokoro (voice-worker.js), so it keeps up with playback on a phone; it sounds a
 // little less lifelike. Same messages as voice-worker.js, so the app treats both alike:
-// Messages in:  {type:"load", threads, voice}  {type:"speak", id, text, voice}  {type:"remove"}
-// Messages out: {type:"progress", phase, loaded, total}  {type:"stage", stage}  {type:"ready", threads}
-//               {type:"audio", id, pcm, rate}  {type:"error", id?, message, stage}
+// Messages in:  {type:"load", threads, voice}  {type:"speak", id, texts:[…], voice}  {type:"remove"}
+// Messages out: {type:"progress", phase, loaded, total}  {type:"stage", stage}  {type:"ready", threads, device, model}
+//               {type:"audio", id, pcm, rate, parts}  {type:"error", id?, message, stage}
+// A passage of a few sentences is read in one go; "parts" is how many ids each sentence became, so the app can
+// find where each sentence starts in the audio.
 // Each voice is a model (~63 MB) plus a small JSON config, downloaded once from Hugging Face (rhasspy/piper-voices)
 // and kept in Cache Storage.
 import "./vendor/stream-iterator.js"; // first: the phonemizer needs it while it loads (Safari)
@@ -73,8 +75,8 @@ async function load(post, threads = 1, voice) {
       const s = await ort.InferenceSession.create(bytes, { executionProviders: ["wasm"], graphOptimizationLevel: "all" });
       setStage(post, "test");
       session = s; loadedVoice = voice;
-      const test = await speak({ text: "Ready." });
-      if (!test.length) throw new Error("the voice produced no sound");
+      const test = await speak({ texts: ["Ready."] });
+      if (!test.pcm.length) throw new Error("the voice produced no sound");
       setStage(post, "ready");
     })().catch((e) => { loading = null; session = null; throw e; });
   }
@@ -109,15 +111,21 @@ async function toPhonemes(text) {
   return out.join("").trim();
 }
 
-async function speak({ text }) {
+async function speak({ texts, text }) {
+  texts = texts || [text];
   const map = config.phoneme_id_map;
-  const pad = map._?.[0] ?? 0, bos = map["^"]?.[0] ?? 1, eos = map.$?.[0] ?? 2;
-  const ph = await toPhonemes(normalize(text));
+  const pad = map._?.[0] ?? 0, bos = map["^"]?.[0] ?? 1, eos = map.$?.[0] ?? 2, space = map[" "];
   // Piper's layout: start, then every phoneme followed by the pad symbol, then end
-  const ids = [bos, pad];
-  for (const ch of ph) { const id = map[ch]; if (id) { ids.push(...id, pad); } }
+  const ids = [bos, pad], parts = [];
+  for (const [k, t] of texts.entries()) {
+    const ph = await toPhonemes(normalize(t));
+    const before = ids.length;
+    if (k && space) ids.push(...space, pad);
+    for (const ch of ph) { const id = map[ch]; if (id) { ids.push(...id, pad); } }
+    parts.push(ids.length - before);
+  }
   ids.push(eos);
-  if (ids.length <= 3) return new Float32Array(0);
+  if (ids.length <= 3) return { pcm: new Float32Array(0), parts };
   const inf = config.inference || {};
   const feeds = {
     input: new ort.Tensor("int64", BigInt64Array.from(ids, BigInt), [1, ids.length]),
@@ -126,17 +134,17 @@ async function speak({ text }) {
   };
   if ((config.num_speakers || 1) > 1 && session.inputNames.includes("sid")) feeds.sid = new ort.Tensor("int64", BigInt64Array.from([0n]), [1]);
   const res = await session.run(feeds);
-  return res[session.outputNames[0]].data.slice();
+  return { pcm: res[session.outputNames[0]].data.slice(), parts };
 }
 
 self.onmessage = async ({ data: m }) => {
   const post = (x, t) => self.postMessage(x, t || []);
   try {
-    if (m.type === "load") { await load(post, m.threads, m.voice); post({ type: "ready", threads: ort.env.wasm.numThreads }); }
+    if (m.type === "load") { await load(post, m.threads, m.voice); post({ type: "ready", threads: ort.env.wasm.numThreads, device: "cpu", model: voiceUrl(m.voice) }); }
     else if (m.type === "speak") {
       await load(post, 1, m.voice);
-      const pcm = await speak(m);
-      post({ type: "audio", id: m.id, pcm, rate: config.audio?.sample_rate || 22050 }, [pcm.buffer]);
+      const { pcm, parts } = await speak(m);
+      post({ type: "audio", id: m.id, pcm, rate: config.audio?.sample_rate || 22050, parts }, [pcm.buffer]);
     } else if (m.type === "remove") {
       await caches.delete(CACHE);
       session = null; loading = null;

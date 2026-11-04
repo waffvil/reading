@@ -331,3 +331,8 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
 .sheet.peek { transform: translateY(calc(100% - 96px)); }
 #scrim { transition: opacity .3s; }
 #scrim.peek { opacity: 0; }
+
+/* the offer to run Kokoro on the graphics chip */
+.gpu-up { display: flex; gap: 12px; align-items: center; padding: 12px; margin: 0 0 8px; border-radius: 12px; background: var(--surface-2); font-size: 13px; line-height: 1.45; }
+.gpu-up b { font-weight: 650; }
+.gpu-up .btn { flex: none; }

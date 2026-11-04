@@ -1023,13 +1023,18 @@ const VOICES = [
   { id: "af_nicole", fam: "kokoro", name: "Nicole", desc: "American · female · soft" },
   { id: "am_michael", fam: "kokoro", name: "Michael", desc: "American · male" },
   { id: "am_fenrir", fam: "kokoro", name: "Fenrir", desc: "American · male · deep" },
+  { id: "am_puck", fam: "kokoro", name: "Puck", desc: "American · male · lively" },
+  { id: "af_sarah", fam: "kokoro", name: "Sarah", desc: "American · female · even" },
+  { id: "af_kore", fam: "kokoro", name: "Kore", desc: "American · female · steady" },
+  { id: "af_aoede", fam: "kokoro", name: "Aoede", desc: "American · female · gentle" },
   { id: "bf_emma", fam: "kokoro", name: "Emma", desc: "British · female" },
   { id: "bm_george", fam: "kokoro", name: "George", desc: "British · male" },
 ];
-const SIZE = { piper: "63 MB", kokoro: "92 MB, shared by all seven" };
+const KOKORO_N = () => VOICES.filter((v) => v.fam === "kokoro").length;
+const sizeOf = (v) => (v.fam === "piper" ? "63 MB" : `${NV.gpu ? "326" : "92"} MB, shared by all ${KOKORO_N()}`);
 // Bump with every change to voice-worker.js or piper-worker.js: they're stored with the voices for offline use,
 // and the version in their address is what makes a phone fetch the new one instead of running a stored copy.
-const NV_REV = 11;
+const NV_REV = 12;
 const NV_WORKERS = { kokoro: `voice-worker.js?v=${NV_REV}`, piper: `piper-worker.js?v=${NV_REV}` };
 const NV_FILES = [
   ...Object.values(NV_WORKERS), "vendor/ort/ort.wasm.min.mjs", "vendor/ort/ort-wasm-simd-threaded.mjs", "vendor/ort/ort-wasm-simd-threaded.wasm",
@@ -1037,6 +1042,10 @@ const NV_FILES = [
   ...VOICES.filter((v) => v.fam === "kokoro").map((v) => `vendor/kokoro/voices/${v.id}.bin`),
 ];
 const NV_MODEL = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx";
+// the same voice in full precision, for the graphics chip (WebGPU): many times faster than NV_MODEL on the processor.
+// (The half-precision build is smaller but goes silent after a couple of seconds on WebGPU.)
+const NV_MODEL_GPU = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx";
+const NV_GPU_FILES = ["vendor/ort-gpu/ort.webgpu.min.mjs", "vendor/ort-gpu/ort-wasm-simd-threaded.jsep.mjs", "vendor/ort-gpu/ort-wasm-simd-threaded.jsep.wasm"];
 const PIPER = "https://huggingface.co/rhasspy/piper-voices/resolve/main/";
 // "en_US-lessac-medium" → en/en_US/lessac/medium/ (same rule as piper-worker.js)
 const piperDir = (id) => { const [loc, name, q] = id.split("-"); return `${loc.split("_")[0]}/${loc}/${name}/${q}/`; };
@@ -1047,8 +1056,12 @@ const previewsOf = (v) => v.fam === "kokoro" ? [`vendor/kokoro/previews/${v.id}.
 const SILENCE = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAwF0AAIC7AAACABAAZGF0YQQAAAAAAAAA";
 const NV = {
   worker: null, workerKey: null, have: new Set(), downloading: null, ready: null, preview: null,
-  clips: new Map(),   // key → { text, url, promise, resolve, reject, sent }
+  clips: new Map(),   // key → { page, start, n, texts, text, url, dur, bounds, promise, resolve, reject, sent }
+  cover: new Map(),   // "page|sentence" → key of the clip that holds that sentence
   want: [],           // keys to have ready, in reading order
+  gpu: false,         // the graphics chip can run the voice (checked at start-up)
+  device: "cpu",      // where the running voice model is: "gpu" | "cpu"
+  bgGpuBroken: prefs.get("gpuBg", "") === "broken", // the phone stops GPU work while Shelf is in the background
   busy: null,         // key the worker is synthesizing
   audio: new Audio(), playingKey: null, playingGen: -1,
 };
@@ -1056,16 +1069,19 @@ NV.audio.preload = "auto";
 NV.audio.setAttribute("playsinline", "");
 const nvVoice = () => { const v = prefs.get("nvVoice", "af_heart"); return voiceOf(v) ? v : "af_heart"; };
 const nvCur = () => voiceOf(nvVoice());
-const voiceReady = (v) => NV.have.has(modelOf(v));
+const voiceReady = (v) => (v.fam === "kokoro" ? NV.have.has(NV_MODEL) || NV.have.has(NV_MODEL_GPU) : NV.have.has(modelOf(v)));
+// Kokoro runs on the graphics chip where it can — unless only the processor model is on the phone and the reader
+// hasn't asked for the faster one (that's a second, bigger download)
+const kokoroDevice = () => (NV.gpu && (NV.have.has(NV_MODEL_GPU) || !NV.have.has(NV_MODEL) || prefs.get("kokoroGpu", false)) ? "gpu" : "cpu");
+const deviceFor = (v) => (v.fam === "kokoro" ? kokoroDevice() : "cpu");
 // one worker per model: all Kokoro voices share one, each Piper voice has its own
 const workerKeyOf = (v) => (v.fam === "kokoro" ? "kokoro" : v.id);
-const nvKey = (page, idx) => `${T.bookId}|${nvVoice()}|${page}|${idx}`;
 
 async function nvCheck() {
   try {
     const c = await caches.open("shelf-voice");
     NV.have = new Set();
-    for (const m of new Set(VOICES.map(modelOf))) if (await c.match(m)) NV.have.add(m);
+    for (const m of new Set([...VOICES.map(modelOf), NV_MODEL_GPU])) if (await c.match(m)) NV.have.add(m);
     // drop stored copies of older voice code
     const current = Object.values(NV_WORKERS);
     for (const r of await c.keys()) if (/\/(voice|piper)-worker\.js/.test(r.url) && !current.some((w) => r.url.endsWith(w))) c.delete(r);
@@ -1102,6 +1118,8 @@ function nvWorker() {
     } else if (m.type === "ready") {
       nvWatch(0);
       NV.threads = m.threads;
+      NV.device = m.device || "cpu";
+      if (m.model) NV.have.add(m.model);
       NV.readyResolve?.();
       nvStatus();
     } else if (m.type === "audio") {
@@ -1109,6 +1127,7 @@ function nvWorker() {
       const c = NV.clips.get(m.id);
       NV.busy = null;
       if (c) {
+        c.bounds = sentenceStarts(m.pcm, m.rate, m.parts?.length === c.n ? m.parts : c.texts.map((t) => t.length));
         c.url = URL.createObjectURL(wavBlob(m.pcm, m.rate)); c.dur = m.pcm.length / m.rate;
         // learn how fast this phone makes speech, so the progress bar's estimate gets better
         const ms = performance.now() - (c.sentAt || performance.now());
@@ -1126,9 +1145,22 @@ function nvWorker() {
         nvWatch(0);
         const c = NV.clips.get(m.id);
         NV.busy = null;
-        if (c) { NV.clips.delete(m.id); c.reject(new Error(m.message)); }
+        // the graphics chip can drop out (the phone reclaimed it); start the voice again and try once more
+        if (c && NV.device === "gpu" && !c.retried) {
+          c.retried = true;
+          if (document.hidden) NV.bgGpuBroken = true, prefs.set("gpuBg", "broken");
+          nvRestart();
+          if (!document.hidden) nvPump();
+          return;
+        }
+        if (c) { dropClip(m.id, c); c.reject(new Error(m.message)); }
         nvPump();
       } else nvFailed(new Error(`${m.message} (while ${STAGES[m.stage] || m.stage})`));
+    } else if (m.type === "gpu-failed") {
+      console.warn("voice: graphics chip failed, using the processor:", m.message);
+      prefs.set("gpuBroken", true);
+      NV.gpu = false;
+      toast("The graphics chip couldn't run the voice — using the processor instead", 4500);
     } else if (m.type === "removed") {
       NV.removedResolve?.();
     }
@@ -1149,6 +1181,14 @@ function nvRestart() {
 }
 function nvStalled(what) {
   console.warn("voice stalled:", what, NV.stage, "threads", nvThreads());
+  // the graphics chip is off-limits while Shelf is in the background: remember that, and carry on with what's
+  // already made; making more resumes when Shelf is back on screen
+  if (document.hidden && NV.device === "gpu" && what === "a sentence") {
+    NV.bgGpuBroken = true;
+    prefs.set("gpuBg", "broken");
+    nvRestart();
+    return;
+  }
   if (nvThreads() > 1) {
     // most likely the multi-threaded engine; quietly start again on one thread
     prefs.set("nvThreads2", 1);
@@ -1182,10 +1222,10 @@ function nvReady() {
     const p = (NV.ready = new Promise((res, rej) => {
       NV.readyResolve = res; NV.readyReject = rej;
       // after a fallback restart, the same promise carries on with the new worker
-      NV.readyRetry = () => { NV.ready = p; nvWorker().postMessage({ type: "load", threads: nvThreads(), voice: nvVoice() }); };
+      NV.readyRetry = () => { NV.ready = p; nvWorker().postMessage({ type: "load", threads: nvThreads(), voice: nvVoice(), device: deviceFor(nvCur()) }); };
     }));
     p.then(() => { NV.readyRetry = null; }, () => { NV.ready = null; NV.readyRetry = null; });
-    nvWorker().postMessage({ type: "load", threads: nvThreads(), voice: nvVoice() });
+    nvWorker().postMessage({ type: "load", threads: nvThreads(), voice: nvVoice(), device: deviceFor(nvCur()) });
   }
   return NV.ready;
 }
@@ -1194,7 +1234,7 @@ function nvStatus() {
   if (!el) return;
   const ready = NV.stage === "ready" && NV.worker;
   el.textContent = NV.lastError && !ready ? "Last problem: " + NV.lastError
-    : ready ? `Voice ready · ${NV.threads > 1 ? NV.threads + " cores" : "1 core"}` + (NV.speed
+    : ready ? `Voice ready · ${NV.device === "gpu" ? "graphics chip" : NV.threads > 1 ? NV.threads + " cores" : "1 core"}` + (NV.speed
       ? NV.speed >= 1.1 ? ` · speaks ${NV.speed.toFixed(1)}× faster than it reads` : ` · slower than real time (${NV.speed.toFixed(1)}×), so expect short pauses`
       : "")
     : NV.worker && NV.stage !== "download" ? `Getting ready: ${STAGES[NV.stage] || NV.stage}…` : "";
@@ -1218,9 +1258,8 @@ async function nvDownload(id) {
   renderVoiceUI();
   try {
     // keep the voices' own code with them, so they work offline even before the next app update
-    caches.open("shelf-voice").then((c) => c.addAll(NV_FILES)).catch((e) => console.warn("voice files", e));
+    caches.open("shelf-voice").then((c) => c.addAll(deviceFor(v) === "gpu" ? [...NV_FILES, ...NV_GPU_FILES] : NV_FILES)).catch((e) => console.warn("voice files", e));
     await nvReady();
-    NV.have.add(modelOf(v));
     prefs.set("engine", "natural");
     toast(`${v.name} is ready — it works offline now`);
   } catch (e) {
@@ -1239,15 +1278,17 @@ function nvUse(id) {
 }
 async function nvRemoveVoice(id) {
   const v = voiceOf(id);
-  const shared = v.fam === "kokoro" ? " This removes all seven Kokoro voices (they share one download)." : "";
+  const shared = v.fam === "kokoro" ? ` This removes all ${KOKORO_N()} Kokoro voices (they share one download).` : "";
   if (!confirm(`Remove ${v.name} from this phone?${shared} You can download it again later.`)) return;
   if (workerKeyOf(v) === NV.workerKey) { if (T.playing) ttsStop(); nvRestart(); nvClear(); }
   try {
     const c = await caches.open("shelf-voice");
     await c.delete(modelOf(v));
     if (v.fam === "piper") await c.delete(modelOf(v) + ".json");
+    if (v.fam === "kokoro") await c.delete(NV_MODEL_GPU);
   } catch {}
   NV.have.delete(modelOf(v));
+  if (v.fam === "kokoro") { NV.have.delete(NV_MODEL_GPU); prefs.set("kokoroGpu", false); }
   renderVoiceUI();
   renderStorage?.();
 }
@@ -1288,19 +1329,55 @@ function wavBlob(pcm, rate) {
   for (let i = 0; i < pcm.length; i++) b.setInt16(44 + i * 2, Math.max(-1, Math.min(1, pcm[i])) * 0x7fff, true);
   return new Blob([b], { type: "audio/wav" });
 }
-function nvClip(key, text) {
+// Where each sentence starts in a passage's audio. The voice says how many sounds each sentence became, which
+// gives a first guess; the guess is then moved to the quietest moment nearby, since sentences end in a pause.
+function sentenceStarts(pcm, rate, parts) {
+  const total = parts.reduce((a, b) => a + b, 0) || 1, n = pcm.length;
+  const win = Math.round(rate * 0.03), step = win >> 1, span = Math.round(rate * 0.6);
+  const out = [0];
+  let cum = 0;
+  for (let k = 0; k < parts.length - 1; k++) {
+    cum += parts[k];
+    const guess = Math.round((n * cum) / total), lo = Math.max(out[out.length - 1] * rate + win, guess - span);
+    let best = guess, bestE = Infinity;
+    for (let i = Math.round(lo); i < Math.min(n - win, guess + span); i += step) {
+      let e = 0;
+      for (let j = i; j < i + win; j++) e += pcm[j] * pcm[j];
+      e *= 1 + (Math.abs(i - guess) / span) * 0.6; // prefer pauses close to the guess
+      if (e < bestE) { bestE = e; best = i; }
+    }
+    out.push((best + win / 2) / rate);
+  }
+  return out;
+}
+const coverKey = (page, idx) => `${page}|${idx}`;
+// the clip holding a sentence, if one is planned for the current book and voice
+function nvClipFor(page, idx) {
+  const c = NV.clips.get(NV.cover.get(coverKey(page, idx)));
+  return c && c.key.startsWith(`${T.bookId}|${nvVoice()}|`) ? c : null;
+}
+// a clip is a passage: one or more sentences in a row on one page, made into a single piece of audio
+function nvClip(page, start, sents) {
+  const key = `${T.bookId}|${nvVoice()}|${page}|${start}|${sents.length}`;
   let c = NV.clips.get(key);
   if (!c) {
-    c = { text };
+    c = { key, page, start, n: sents.length, texts: sents.map((s) => s.text) };
+    c.text = c.texts.join(" ");
     c.promise = new Promise((res, rej) => { c.resolve = res; c.reject = rej; });
     c.promise.catch(() => {});
     NV.clips.set(key, c);
+    for (let k = 0; k < c.n; k++) NV.cover.set(coverKey(page, start + k), key);
   }
   return c;
+}
+function dropClip(key, c) {
+  NV.clips.delete(key);
+  for (let k = 0; k < c.n; k++) { const ck = coverKey(c.page, c.start + k); if (NV.cover.get(ck) === key) NV.cover.delete(ck); }
 }
 // hand the worker the next sentence that's wanted and not made yet (one at a time, so a skip never waits behind stale work)
 function nvPump() {
   if (NV.busy) return;
+  if (document.hidden && NV.device === "gpu" && NV.bgGpuBroken) return; // wait until Shelf is back on screen
   const key = NV.want.find((k) => { const c = NV.clips.get(k); return c && !c.sent; });
   if (!key) return;
   const c = NV.clips.get(key);
@@ -1310,30 +1387,49 @@ function nvPump() {
     if (NV.busy !== key) return;
     nvWatch(45000 + c.text.length * 300, "a sentence");
     c.sentAt = performance.now();
-    nvWorker().postMessage({ type: "speak", id: key, text: c.text, voice: key.split("|")[1] });
+    nvWorker().postMessage({ type: "speak", id: key, texts: c.texts, voice: key.split("|")[1], device: deviceFor(nvCur()) });
   }, (e) => {
     NV.busy = null;
     for (const [k, x] of NV.clips) if (!x.url) { NV.clips.delete(k); x.reject(e); }
   });
 }
-// queue the current sentence and the next ~minute of reading; drop audio that's no longer needed
+// Plan the passages from here on and queue them in reading order; drop audio that's no longer needed.
+// The first passage after a start or skip is a single sentence, so sound starts quickly; after that, passages
+// of up to a few sentences, so the voice flows from one sentence into the next. On the graphics chip, which
+// makes speech several times faster than it's read, it prepares several minutes ahead — that is what keeps
+// playing if the phone pauses the chip while the screen is locked.
 async function nvPlan() {
   const want = [];
   let page = T.page, idx = T.idx, sents = T.sents, chars = 0, pages = 0;
-  const bookId = T.bookId;
-  while (want.length < 10 && chars < 1100) {
+  const bookId = T.bookId, gpu = NV.device === "gpu" && nvCur().fam === "kokoro";
+  const maxChars = gpu ? 320 : 220, maxN = gpu ? 4 : 3, horizon = gpu ? 6000 : 1200;
+  const cur = nvClipFor(page, idx);
+  if (cur) idx = cur.start;
+  let first = !cur;
+  while (want.length < 60 && chars < horizon) {
     if (idx >= sents.length) {
-      if (page >= R.book.pages || ++pages > 4) break;
+      if (page >= R.book.pages || ++pages > 12) break;
       page++; idx = 0;
       sents = await sentencesFor(page);
       if (bookId !== T.bookId || !R.book) return;
       continue;
     }
-    const key = nvKey(page, idx);
-    nvClip(key, sents[idx].text);
-    want.push(key);
-    chars += sents[idx].text.length;
-    idx++;
+    let c = nvClipFor(page, idx);
+    if (!c || c.start !== idx) {
+      const take = [sents[idx]];
+      let len = sents[idx].text.length;
+      while (!first && take.length < maxN && idx + take.length < sents.length) {
+        const s = sents[idx + take.length];
+        if (len + s.text.length + 1 > maxChars || NV.cover.has(coverKey(page, idx + take.length))) break;
+        take.push(s);
+        len += s.text.length + 1;
+      }
+      c = nvClip(page, idx, take);
+    }
+    first = false;
+    want.push(c.key);
+    chars += c.text.length;
+    idx = c.start + c.n;
   }
   NV.want = want;
   const keep = new Set(want);
@@ -1341,22 +1437,44 @@ async function nvPlan() {
     if (keep.has(k) || k === NV.playingKey || k === NV.busy) continue;
     if (c.url) URL.revokeObjectURL(c.url);
     else c.reject(new Error("skipped"));
-    NV.clips.delete(k);
+    dropClip(k, c);
   }
   nvPump();
 }
 function nvClear() {
   for (const c of NV.clips.values()) { if (c.url) URL.revokeObjectURL(c.url); else c.reject(new Error("cleared")); }
   NV.clips.clear();
+  NV.cover.clear();
   NV.want = [];
   NV.playingKey = null;
   NV.audio.removeAttribute("src");
 }
 NV.audio.addEventListener("ended", () => {
-  if (T.playing && NV.playingGen === T.gen && engine() === "natural") advance();
+  if (!(T.playing && NV.playingGen === T.gen && engine() === "natural")) return;
+  const c = NV.clips.get(NV.playingKey);
+  if (c && c.page === T.page) T.idx = c.start + c.n - 1; // the passage is done: carry on after its last sentence
+  advance();
 });
+// move the highlight along as the passage plays
+function nvTrack() {
+  if (!T.playing || engine() !== "natural") return;
+  const c = NV.clips.get(NV.playingKey);
+  if (!c?.bounds || c.page !== T.page || NV.playingGen !== T.gen) return;
+  const t = NV.audio.currentTime;
+  let k = 0;
+  while (k < c.n - 1 && t >= c.bounds[k + 1]) k++;
+  if (c.start + k !== T.idx) {
+    T.idx = c.start + k;
+    drawTts(T.sents[T.idx]);
+    follow(T.sents[T.idx]);
+  }
+}
+NV.audio.addEventListener("timeupdate", nvTrack);
+setInterval(() => { if (!document.hidden) nvTrack(); }, 150);
 NV.audio.addEventListener("pause", () => {
-  // paused from outside the app (headphones out, a call, Control Center): reflect it
+  // paused from outside the app (headphones out, a call, Control Center): reflect it. A pause that comes from
+  // switching to the next passage is ours, not the reader's.
+  if (performance.now() - (NV.switchAt || 0) < 800) return;
   if (T.playing && NV.playingGen === T.gen && !NV.audio.ended && NV.audio.currentTime > 0 && engine() === "natural") {
     T.playing = false; T.gen++; releaseWake(); updatePlayer();
   }
@@ -1371,7 +1489,7 @@ function voiceRow(v) {
   const have = voiceReady(v), cur = v.id === nvVoice() && have, dl = NV.downloading === v.id;
   const sub = dl ? "Starting download…"
     : have ? `${esc(v.desc)} · on this phone · <button class="link-btn inline" data-act="remove">Remove</button>`
-    : `${esc(v.desc)} · ${SIZE[v.fam]}`;
+    : `${esc(v.desc)} · ${sizeOf(v)}`;
   const act = dl ? `<span class="vr-on">…</span>`
     : cur ? `<span class="vr-on">✓ In use</span>`
     : have ? `<button class="btn small" data-act="use">Use</button>`
@@ -1388,10 +1506,24 @@ function renderVoiceUI() {
   $("#nv-box").hidden = eng !== "natural";
   $("#sys-box").hidden = eng !== "system";
   $("#vl-piper").innerHTML = VOICES.filter((v) => v.fam === "piper").map(voiceRow).join("");
-  $("#vl-kokoro").innerHTML = VOICES.filter((v) => v.fam === "kokoro").map(voiceRow).join("");
+  // Kokoro already on the phone in the processor version, and this phone has a graphics chip that can run it:
+  // offer the faster version
+  const up = NV.gpu && NV.have.has(NV_MODEL) && !NV.have.has(NV_MODEL_GPU);
+  $("#vl-kokoro").innerHTML = (up ? `<div class="gpu-up"><div><b>Make these voices play smoothly.</b> This phone can run them on its graphics chip, many times faster, so they keep up without pauses. One 326 MB download (Wi-Fi recommended).</div><button class="btn small primary" data-act="gpu"${NV.downloading ? " disabled" : ""}>Download</button></div>` : "")
+    + VOICES.filter((v) => v.fam === "kokoro").map(voiceRow).join("");
+  $("#kokoro-label").textContent = NV.gpu && kokoroDevice() === "gpu" ? "Most natural · smooth on this phone" : "Most natural · may pause between sentences on a phone";
   nvStatus();
 }
 nvCheck();
+// can this phone's graphics chip run the voice? (WebGPU: iOS 26 Safari, recent Chrome.) The worker proves it with
+// a test sentence before relying on it, and falls back to the processor if it can't.
+(async () => {
+  try {
+    if (prefs.get("gpuBroken", false) || !navigator.gpu) return;
+    NV.gpu = !!(await navigator.gpu.requestAdapter());
+  } catch {}
+  renderVoiceUI();
+})();
 
 // ---- text → sentences, each with highlight boxes in page fractions
 const ABBR = /^(mr|mrs|ms|dr|st|vs|etc|cf|fig|figs|no|vol|pp|p|e\.g|i\.e|inc|ltd|jr|sr|prof|ch|eq|approx)$/i;
@@ -1618,8 +1750,7 @@ async function nvSpeakCurrent() {
   const s = T.sents[T.idx];
   if (!s) return;
   const gen = ++T.gen;
-  const key = nvKey(T.page, T.idx);
-  const c = nvClip(key, s.text);
+  const c = nvClipFor(T.page, T.idx) || nvClip(T.page, T.idx, [s]);
   drawTts(s);
   follow(s);
   nvPlan();
@@ -1635,9 +1766,17 @@ async function nvSpeakCurrent() {
   if (gen !== T.gen || !T.playing) return;
   setBuffering(false);
   const a = NV.audio;
-  NV.playingKey = key;
+  // start at this sentence: the passage may begin a sentence or two earlier
+  const at = c.bounds ? c.bounds[T.idx - c.start] || 0 : 0;
   NV.playingGen = gen;
-  a.src = url;
+  if (NV.playingKey === c.key && a.getAttribute("src") === url) {
+    try { a.currentTime = at; } catch {}
+  } else {
+    NV.playingKey = c.key;
+    NV.switchAt = performance.now();
+    a.src = url;
+    if (at > 0.05) a.addEventListener("loadedmetadata", () => { try { a.currentTime = at; } catch {} }, { once: true });
+  }
   a.playbackRate = prefs.get("rate", 1);
   a.play().catch((e) => {
     if (gen !== T.gen) return;
@@ -1657,7 +1796,7 @@ function setBuffering(on) {
 function drawProgress() {
   const box = $("#tts-status");
   if (!T.playing || engine() !== "natural") { box.hidden = true; return clearInterval(NV.progTimer); }
-  const c = NV.clips.get(nvKey(T.page, T.idx));
+  const c = nvClipFor(T.page, T.idx);
   const secs = Math.round((performance.now() - NV.waitStart) / 1000);
   let label, frac = null;
   if (NV.stage === "download" || NV.stage === "load") { label = NV.stage === "load" ? "Loading the voice" : "Downloading the voice"; frac = NV.loadFrac || 0; }
@@ -1699,7 +1838,7 @@ async function ttsPlay() {
   // iOS only lets sound start inside a tap, so wake the right engine now, before any await
   if (natural) {
     const a = NV.audio;
-    if (NV.playingKey && NV.playingKey === nvKey(T.page, T.idx) && a.getAttribute("src") && !a.ended && T.bookId === R.book.id) {
+    if (NV.playingKey && NV.playingKey === nvClipFor(T.page, T.idx)?.key && a.getAttribute("src") && !a.ended && T.bookId === R.book.id) {
       T.playing = true;
       NV.playingGen = ++T.gen;
       a.playbackRate = prefs.get("rate", 1);
@@ -1819,6 +1958,11 @@ $("#seg-engine").addEventListener("click", (e) => {
 });
 $("#nv-box").addEventListener("click", (e) => {
   const b = e.target.closest("[data-act]"), row = e.target.closest(".vrow");
+  if (b?.dataset.act === "gpu") {
+    prefs.set("kokoroGpu", true);
+    if (NV.workerKey === "kokoro") nvRestart();
+    return nvDownload(nvCur().fam === "kokoro" ? nvVoice() : "af_heart");
+  }
   if (!b || !row) return;
   const id = row.dataset.id;
   if (b.dataset.act === "preview") nvPreview(id);
@@ -1839,7 +1983,7 @@ document.addEventListener("visibilitychange", () => {
   refreshVoices(); // a voice downloaded in iOS Settings while we were away
   if (!T.playing) return;
   acquireWake();
-  if (engine() === "natural") { drawTts(T.sents[T.idx]); follow(T.sents[T.idx]); return; } // kept playing while away
+  if (engine() === "natural") { drawTts(T.sents[T.idx]); follow(T.sents[T.idx]); nvPump(); return; } // kept playing while away
   if (!synth.speaking && !synth.pending) speakCurrent(); // the OS paused us while away — pick the sentence back up
 });
 // safety net: some engines finish an utterance without ever firing "end"
