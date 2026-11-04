@@ -903,7 +903,7 @@ const T = {
   playing: false, bookId: null, page: 0, sents: [], idx: 0, gen: 0, cache: new Map(),
   userScrollAt: 0, progScrollUntil: 0, wake: null, voices: [], started: false, hlPage: 0,
 };
-const engine = () => (prefs.get("engine", "system") === "natural" && NV.downloaded ? "natural" : "system");
+const engine = () => (prefs.get("engine", "system") === "natural" && voiceReady(nvCur()) ? "natural" : "system");
 
 // ---- device voices
 // iOS names a voice the same whatever its quality ("Ava"); only the voiceURI says which one is Premium/Enhanced.
@@ -953,24 +953,45 @@ if (synth) {
   synth.addEventListener?.("voiceschanged", loadVoices);
 }
 
-// ---- natural voice (Kokoro, on-device)
-const NV_VOICES = [
-  ["af_heart", "Heart · US, warm"], ["af_bella", "Bella · US, bright"], ["af_nicole", "Nicole · US, soft"],
-  ["am_michael", "Michael · US, male"], ["am_fenrir", "Fenrir · US, male, deep"],
-  ["bf_emma", "Emma · British"], ["bm_george", "George · British, male"],
+// ---- natural voices (on-device)
+// Two families. Piper voices are light, so they keep up with playback on a phone; each is its own download.
+// Kokoro voices sound the most natural but are heavy for a phone; all seven share one model download.
+const VOICES = [
+  { id: "en_US-lessac-medium", fam: "piper", name: "Lessac", desc: "US · female · clear" },
+  { id: "en_US-amy-medium", fam: "piper", name: "Amy", desc: "US · female" },
+  { id: "en_US-ryan-medium", fam: "piper", name: "Ryan", desc: "US · male" },
+  { id: "en_US-joe-medium", fam: "piper", name: "Joe", desc: "US · male · relaxed" },
+  { id: "en_GB-alba-medium", fam: "piper", name: "Alba", desc: "Scottish · female" },
+  { id: "en_GB-northern_english_male-medium", fam: "piper", name: "Northern English", desc: "British · male" },
+  { id: "af_heart", fam: "kokoro", name: "Heart", desc: "US · female · warm" },
+  { id: "af_bella", fam: "kokoro", name: "Bella", desc: "US · female · bright" },
+  { id: "af_nicole", fam: "kokoro", name: "Nicole", desc: "US · female · soft" },
+  { id: "am_michael", fam: "kokoro", name: "Michael", desc: "US · male" },
+  { id: "am_fenrir", fam: "kokoro", name: "Fenrir", desc: "US · male · deep" },
+  { id: "bf_emma", fam: "kokoro", name: "Emma", desc: "British · female" },
+  { id: "bm_george", fam: "kokoro", name: "George", desc: "British · male" },
 ];
-// Bump with every change to voice-worker.js: it's stored with the voice for offline use, and the version in its
-// address is what makes a phone fetch the new one instead of running the stored copy forever.
-const NV_REV = 9;
-const NV_WORKER = `voice-worker.js?v=${NV_REV}`;
+const SIZE = { piper: "63 MB", kokoro: "92 MB, shared by all seven" };
+// Bump with every change to voice-worker.js or piper-worker.js: they're stored with the voices for offline use,
+// and the version in their address is what makes a phone fetch the new one instead of running a stored copy.
+const NV_REV = 10;
+const NV_WORKERS = { kokoro: `voice-worker.js?v=${NV_REV}`, piper: `piper-worker.js?v=${NV_REV}` };
 const NV_FILES = [
-  NV_WORKER, "vendor/ort/ort.wasm.min.mjs", "vendor/ort/ort-wasm-simd-threaded.mjs", "vendor/ort/ort-wasm-simd-threaded.wasm",
-  "vendor/phonemizer/phonemizer.js", "vendor/stream-iterator.js", "vendor/kokoro/vocab.json", ...NV_VOICES.map(([v]) => `vendor/kokoro/voices/${v}.bin`),
+  ...Object.values(NV_WORKERS), "vendor/ort/ort.wasm.min.mjs", "vendor/ort/ort-wasm-simd-threaded.mjs", "vendor/ort/ort-wasm-simd-threaded.wasm",
+  "vendor/phonemizer/phonemizer.js", "vendor/stream-iterator.js", "vendor/kokoro/vocab.json",
+  ...VOICES.filter((v) => v.fam === "kokoro").map((v) => `vendor/kokoro/voices/${v.id}.bin`),
 ];
 const NV_MODEL = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx";
+const PIPER = "https://huggingface.co/rhasspy/piper-voices/resolve/main/";
+// "en_US-lessac-medium" → en/en_US/lessac/medium/ (same rule as piper-worker.js)
+const piperDir = (id) => { const [loc, name, q] = id.split("-"); return `${loc.split("_")[0]}/${loc}/${name}/${q}/`; };
+const voiceOf = (id) => VOICES.find((v) => v.id === id);
+const modelOf = (v) => (v.fam === "kokoro" ? NV_MODEL : `${PIPER}${piperDir(v.id)}${v.id}.onnx`);
+const previewsOf = (v) => v.fam === "kokoro" ? [`vendor/kokoro/previews/${v.id}.mp3`]
+  : [`${PIPER}${piperDir(v.id)}samples/speaker_0.mp3`, `https://rhasspy.github.io/piper-samples/samples/${piperDir(v.id)}speaker_0.mp3`];
 const SILENCE = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAwF0AAIC7AAACABAAZGF0YQQAAAAAAAAA";
 const NV = {
-  worker: null, downloaded: false, downloading: false, ready: null,
+  worker: null, workerKey: null, have: new Set(), downloading: null, ready: null, preview: null,
   clips: new Map(),   // key → { text, url, promise, resolve, reject, sent }
   want: [],           // keys to have ready, in reading order
   busy: null,         // key the worker is synthesizing
@@ -978,16 +999,22 @@ const NV = {
 };
 NV.audio.preload = "auto";
 NV.audio.setAttribute("playsinline", "");
-const nvVoice = () => { const v = prefs.get("nvVoice", "af_heart"); return NV_VOICES.some(([k]) => k === v) ? v : "af_heart"; };
+const nvVoice = () => { const v = prefs.get("nvVoice", "af_heart"); return voiceOf(v) ? v : "af_heart"; };
+const nvCur = () => voiceOf(nvVoice());
+const voiceReady = (v) => NV.have.has(modelOf(v));
+// one worker per model: all Kokoro voices share one, each Piper voice has its own
+const workerKeyOf = (v) => (v.fam === "kokoro" ? "kokoro" : v.id);
 const nvKey = (page, idx) => `${T.bookId}|${nvVoice()}|${page}|${idx}`;
 
 async function nvCheck() {
   try {
     const c = await caches.open("shelf-voice");
-    NV.downloaded = !!(await c.match(NV_MODEL));
+    NV.have = new Set();
+    for (const m of new Set(VOICES.map(modelOf))) if (await c.match(m)) NV.have.add(m);
     // drop stored copies of older voice code
-    for (const r of await c.keys()) if (/\/voice-worker\.js/.test(r.url) && !r.url.endsWith(NV_WORKER)) c.delete(r);
-  } catch { NV.downloaded = false; }
+    const current = Object.values(NV_WORKERS);
+    for (const r of await c.keys()) if (/\/(voice|piper)-worker\.js/.test(r.url) && !current.some((w) => r.url.endsWith(w))) c.delete(r);
+  } catch {}
   renderVoiceUI();
 }
 // How many CPU threads to try. Threads make the voice faster but need cross-origin isolation, and they can stall
@@ -998,15 +1025,19 @@ const nvThreads = () => (self.crossOriginIsolated ? prefs.get("nvThreads2", Math
 const STAGES = { starting: "starting", download: "downloading the voice", load: "loading the voice", engine: "starting the voice engine", test: "a test sentence", ready: "ready" };
 function nvWorker() {
   if (NV.worker) return NV.worker;
-  const w = (NV.worker = new Worker(NV_WORKER, { type: "module" }));
+  const v = nvCur();
+  const w = (NV.worker = new Worker(NV_WORKERS[v.fam], { type: "module" }));
+  NV.workerKey = workerKeyOf(v);
   NV.stage = "starting";
   w.onmessage = ({ data: m }) => {
     if (m.type === "progress") {
       NV.loadFrac = m.loaded / m.total;
-      if (m.phase === "download") {
-        const bar = $("#nv-progress i");
-        if (bar) bar.style.width = Math.round(NV.loadFrac * 100) + "%";
-        $("#nv-download").textContent = `Downloading… ${Math.round(m.loaded / 1e6)} of ${Math.round(m.total / 1e6)} MB`;
+      if (m.phase === "download" && NV.downloading) {
+        const row = document.querySelector(`.vrow[data-id="${NV.downloading}"]`);
+        if (row) {
+          row.querySelector(".progress i").style.width = Math.round(NV.loadFrac * 100) + "%";
+          row.querySelector(".vr-sub").textContent = `Downloading… ${Math.round(m.loaded / 1e6)} of ${Math.round(m.total / 1e6)} MB`;
+        }
       }
     } else if (m.type === "stage") {
       NV.stage = m.stage;
@@ -1027,8 +1058,8 @@ function nvWorker() {
         // learn how fast this phone makes speech, so the progress bar's estimate gets better
         const ms = performance.now() - (c.sentAt || performance.now());
         if (c.text.length > 20 && ms > 0) {
-          const old = prefs.get("nvMsPerChar", 0), now = ms / c.text.length;
-          prefs.set("nvMsPerChar", old ? old * 0.7 + now * 0.3 : now);
+          const k = "nvMsPerChar." + nvCur().fam, old = prefs.get(k, 0), now = ms / c.text.length;
+          prefs.set(k, old ? old * 0.7 + now * 0.3 : now);
           NV.speed = NV.speed ? NV.speed * 0.7 + (c.dur * 1000 / ms) * 0.3 : c.dur * 1000 / ms;
         }
         c.resolve(c.url);
@@ -1096,10 +1127,10 @@ function nvReady() {
     const p = (NV.ready = new Promise((res, rej) => {
       NV.readyResolve = res; NV.readyReject = rej;
       // after a fallback restart, the same promise carries on with the new worker
-      NV.readyRetry = () => { NV.ready = p; nvWorker().postMessage({ type: "load", threads: nvThreads() }); };
+      NV.readyRetry = () => { NV.ready = p; nvWorker().postMessage({ type: "load", threads: nvThreads(), voice: nvVoice() }); };
     }));
     p.then(() => { NV.readyRetry = null; }, () => { NV.ready = null; NV.readyRetry = null; });
-    nvWorker().postMessage({ type: "load", threads: nvThreads() });
+    nvWorker().postMessage({ type: "load", threads: nvThreads(), voice: nvVoice() });
   }
   return NV.ready;
 }
@@ -1115,35 +1146,82 @@ function nvStatus() {
   el.textContent = (el.textContent ? el.textContent + " · " : "") + `version ${NV_REV}`;
   el.hidden = false;
 }
-async function nvDownload() {
-  if (NV.downloading) return;
-  NV.downloading = true;
+// switch the worker to the chosen voice's model (a different model needs a fresh worker)
+function nvSwitch() {
+  if (T.playing && engine() === "natural") ttsPause();
+  nvClear();
+  if (NV.worker && NV.workerKey !== workerKeyOf(nvCur())) nvRestart();
+  NV.speed = 0;
+}
+async function nvDownload(id) {
+  if (NV.downloading) return toast("One download at a time — wait for this one to finish");
+  const v = voiceOf(id);
+  prefs.set("nvVoice", id);
+  nvSwitch();
+  NV.downloading = id;
+  NV.lastError = null;
   renderVoiceUI();
   try {
-    // keep the voice's own code with it, so it works offline even before the next app update
+    // keep the voices' own code with them, so they work offline even before the next app update
     caches.open("shelf-voice").then((c) => c.addAll(NV_FILES)).catch((e) => console.warn("voice files", e));
     await nvReady();
-    NV.downloaded = true;
+    NV.have.add(modelOf(v));
     prefs.set("engine", "natural");
-    toast("Natural voice ready — it works offline now");
+    toast(`${v.name} is ready — it works offline now`);
   } catch (e) {
-    toast(navigator.onLine ? "Download failed: " + e.message : "You're offline — connect to download the voice", 4500);
+    toast(navigator.onLine ? `Couldn't get ${v.name}: ` + e.message : "You're offline — connect to download a voice", 5000);
   }
-  NV.downloading = false;
+  NV.downloading = null;
   renderVoiceUI();
 }
-async function nvRemove() {
-  if (T.playing && engine() === "natural") ttsStop();
-  const done = new Promise((res) => (NV.removedResolve = res));
-  nvWorker().postMessage({ type: "remove" });
-  await Promise.race([done, new Promise((r) => setTimeout(r, 3000))]);
-  try { await caches.delete("shelf-voice"); } catch {}
-  NV.worker?.terminate();
-  NV.worker = null; NV.ready = null; NV.downloaded = false;
-  nvClear();
-  prefs.set("engine", "system");
+function nvUse(id) {
+  prefs.set("nvVoice", id);
+  prefs.set("engine", "natural");
+  const playing = T.playing;
+  nvSwitch();
+  renderVoiceUI();
+  if (playing && R.book) ttsPlay();
+}
+async function nvRemoveVoice(id) {
+  const v = voiceOf(id);
+  const shared = v.fam === "kokoro" ? " This removes all seven Kokoro voices (they share one download)." : "";
+  if (!confirm(`Remove ${v.name} from this phone?${shared} You can download it again later.`)) return;
+  if (workerKeyOf(v) === NV.workerKey) { if (T.playing) ttsStop(); nvRestart(); nvClear(); }
+  try {
+    const c = await caches.open("shelf-voice");
+    await c.delete(modelOf(v));
+    if (v.fam === "piper") await c.delete(modelOf(v) + ".json");
+  } catch {}
+  NV.have.delete(modelOf(v));
   renderVoiceUI();
   renderStorage?.();
+}
+// a short sample of a voice before you download it (Kokoro samples ship with the app; Piper's are online)
+function nvPreview(id) {
+  const btn = document.querySelector(`.vrow[data-id="${id}"] .vr-play`);
+  if (NV.preview) {
+    const was = NV.preview.id;
+    NV.preview.a.pause(); NV.preview = null;
+    document.querySelectorAll(".vr-play.on").forEach((b) => b.classList.remove("on"));
+    if (was === id) return;
+  }
+  if (T.playing) ttsPause();
+  const a = new Audio();
+  a.crossOrigin = "anonymous"; // the page is cross-origin isolated, so outside audio has to come with CORS
+  const urls = previewsOf(voiceOf(id));
+  let i = 0;
+  NV.preview = { id, a };
+  btn?.classList.add("on");
+  const done = () => { if (NV.preview?.a === a) { NV.preview = null; btn?.classList.remove("on"); } };
+  a.onended = done;
+  a.onerror = () => {
+    if (NV.preview?.a !== a) return;
+    if (++i < urls.length) { a.src = urls[i]; a.play().catch(() => {}); return; }
+    done();
+    toast(navigator.onLine ? "No preview available for this voice" : "Previews need internet", 3000);
+  };
+  a.src = urls[0];
+  a.play().catch(() => {});
 }
 function wavBlob(pcm, rate) {
   const b = new DataView(new ArrayBuffer(44 + pcm.length * 2));
@@ -1232,21 +1310,31 @@ NV.audio.addEventListener("error", () => {
   if (T.playing && NV.playingGen === T.gen && engine() === "natural" && NV.audio.getAttribute("src")) { console.warn("audio", NV.audio.error); advance(); }
 });
 
+const ICON_PLAY = `<svg viewBox="0 0 24 24"><path d="M8 5.5v13l11-6.5z"/></svg>`;
+const ICON_STOP = `<svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>`;
+function voiceRow(v) {
+  const have = voiceReady(v), cur = v.id === nvVoice() && have, dl = NV.downloading === v.id;
+  const sub = dl ? "Starting download…"
+    : have ? `${esc(v.desc)} · on this phone · <button class="link-btn inline" data-act="remove">Remove</button>`
+    : `${esc(v.desc)} · ${SIZE[v.fam]}`;
+  const act = dl ? `<span class="vr-on">…</span>`
+    : cur ? `<span class="vr-on">✓ In use</span>`
+    : have ? `<button class="btn small" data-act="use">Use</button>`
+    : `<button class="btn small" data-act="download"${NV.downloading ? " disabled" : ""}>Download</button>`;
+  return `<div class="vrow${cur ? " cur" : ""}" data-id="${v.id}">
+    <button class="vr-play${NV.preview?.id === v.id ? " on" : ""}" data-act="preview" aria-label="Preview ${esc(v.name)}">${ICON_PLAY}${ICON_STOP}</button>
+    <div class="vr-main"><div class="vr-name">${esc(v.name)}</div><div class="vr-sub">${sub}</div>${dl ? `<div class="progress"><i style="width:0"></i></div>` : ""}</div>
+    ${act}
+  </div>`;
+}
 function renderVoiceUI() {
   const eng = prefs.get("engine", "system") === "natural" ? "natural" : "system";
   markSeg("#seg-engine", eng);
   $("#nv-box").hidden = eng !== "natural";
   $("#sys-box").hidden = eng !== "system";
-  const dl = $("#nv-download");
-  dl.hidden = NV.downloaded;
-  dl.disabled = NV.downloading;
-  if (!NV.downloading) dl.textContent = "Download natural voice · 92 MB";
-  $("#nv-progress").hidden = !NV.downloading;
-  if (!NV.downloading) $("#nv-progress i").style.width = "0";
-  $("#nv-voice").hidden = !NV.downloaded;
-  $("#nv-remove").hidden = !NV.downloaded;
+  $("#vl-piper").innerHTML = VOICES.filter((v) => v.fam === "piper").map(voiceRow).join("");
+  $("#vl-kokoro").innerHTML = VOICES.filter((v) => v.fam === "kokoro").map(voiceRow).join("");
   nvStatus();
-  $("#nv-voice").innerHTML = NV_VOICES.map(([k, label]) => `<option value="${k}"${k === nvVoice() ? " selected" : ""}>${esc(label)}</option>`).join("");
 }
 nvCheck();
 
@@ -1502,7 +1590,7 @@ function drawProgress() {
   else if (NV.stage === "test") label = "Warming up";
   else {
     label = "Preparing the next sentence";
-    const per = prefs.get("nvMsPerChar", 0);
+    const per = prefs.get("nvMsPerChar." + nvCur().fam, 0);
     if (c?.sentAt && per) frac = Math.min(0.96, (performance.now() - c.sentAt) / (per * c.text.length));
   }
   box.hidden = false;
@@ -1530,6 +1618,7 @@ async function advance() {
 
 async function ttsPlay() {
   const natural = engine() === "natural";
+  if (!natural && prefs.get("engine", "system") === "natural") return toast("Download a natural voice first: Aa → Natural (or pick Device voices)", 4500);
   if (!natural && !synth) return toast("This browser can't read aloud");
   // iOS only lets sound start inside a tap, so wake the right engine now, before any await
   if (natural) {
@@ -1652,25 +1741,14 @@ $("#seg-engine").addEventListener("click", (e) => {
   if (was !== engine()) nvClear();
   renderVoiceUI();
 });
-$("#nv-download").addEventListener("click", nvDownload);
-$("#nv-remove").addEventListener("click", () => { if (confirm("Remove the natural voice from this device? You can download it again later.")) nvRemove(); });
-$("#nv-voice").addEventListener("change", async (e) => {
-  prefs.set("nvVoice", e.target.value);
-  const playing = T.playing;
-  if (playing) ttsPause();
-  nvClear();
-  if (playing) return ttsPlay();
-  // a short sample, so you can hear the voice you picked
-  try {
-    const a = NV.audio;
-    a.src = SILENCE; a.play().catch(() => {});
-    const key = `sample|${nvVoice()}|0|0`;
-    const c = nvClip(key, "This is how I'll read your book.");
-    NV.want = [key]; nvPump();
-    const url = await c.promise;
-    if (T.playing) return;
-    a.src = url; a.playbackRate = 1; a.play().catch(() => {});
-  } catch {}
+$("#nv-box").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-act]"), row = e.target.closest(".vrow");
+  if (!b || !row) return;
+  const id = row.dataset.id;
+  if (b.dataset.act === "preview") nvPreview(id);
+  else if (b.dataset.act === "download") nvDownload(id);
+  else if (b.dataset.act === "use") nvUse(id);
+  else if (b.dataset.act === "remove") nvRemoveVoice(id);
 });
 if ("mediaSession" in navigator) {
   try {
