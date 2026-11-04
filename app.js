@@ -961,11 +961,11 @@ const NV_VOICES = [
 ];
 // Bump with every change to voice-worker.js: it's stored with the voice for offline use, and the version in its
 // address is what makes a phone fetch the new one instead of running the stored copy forever.
-const NV_REV = 7;
+const NV_REV = 8;
 const NV_WORKER = `voice-worker.js?v=${NV_REV}`;
 const NV_FILES = [
   NV_WORKER, "vendor/ort/ort.wasm.min.mjs", "vendor/ort/ort-wasm-simd-threaded.mjs", "vendor/ort/ort-wasm-simd-threaded.wasm",
-  "vendor/phonemizer/phonemizer.js", "vendor/kokoro/vocab.json", ...NV_VOICES.map(([v]) => `vendor/kokoro/voices/${v}.bin`),
+  "vendor/phonemizer/phonemizer.js", "vendor/stream-iterator.js", "vendor/kokoro/vocab.json", ...NV_VOICES.map(([v]) => `vendor/kokoro/voices/${v}.bin`),
 ];
 const NV_MODEL = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx";
 const SILENCE = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAwF0AAIC7AAACABAAZGF0YQQAAAAAAAAA";
