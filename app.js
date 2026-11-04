@@ -981,44 +981,105 @@ async function nvCheck() {
   try { NV.downloaded = !!(await (await caches.open("shelf-voice")).match(NV_MODEL)); } catch { NV.downloaded = false; }
   renderVoiceUI();
 }
+// How many CPU threads to try. Threads make the voice faster but need cross-origin isolation, and they can stall
+// on some phones, so a start that doesn't finish in time falls back to one thread and remembers that.
+// iPhone/iPad start on one thread: that's where the multi-threaded engine has been seen to stall.
+const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const nvThreads = () => (self.crossOriginIsolated ? prefs.get("nvThreads", IOS ? 1 : Math.min(4, navigator.hardwareConcurrency || 2)) : 1);
+const STAGES = { starting: "starting", download: "loading the voice file", engine: "starting the voice engine", test: "a test sentence", ready: "ready" };
 function nvWorker() {
   if (NV.worker) return NV.worker;
   const w = (NV.worker = new Worker("voice-worker.js", { type: "module" }));
+  NV.stage = "starting";
   w.onmessage = ({ data: m }) => {
     if (m.type === "progress") {
       const bar = $("#nv-progress i");
       if (bar) bar.style.width = Math.round((m.loaded / m.total) * 100) + "%";
       $("#nv-download").textContent = `Downloading… ${Math.round(m.loaded / 1e6)} of ${Math.round(m.total / 1e6)} MB`;
+    } else if (m.type === "stage") {
+      NV.stage = m.stage;
+      // the download can take minutes; the rest should be quick, so time it from here
+      if (m.stage === "engine") nvWatch(40000, "start-up");
+      if (m.stage !== "download") nvStatus();
     } else if (m.type === "ready") {
+      nvWatch(0);
+      NV.threads = m.threads;
       NV.readyResolve?.();
+      nvStatus();
     } else if (m.type === "audio") {
+      nvWatch(0);
       const c = NV.clips.get(m.id);
       NV.busy = null;
       if (c) { c.url = URL.createObjectURL(wavBlob(m.pcm, m.rate)); c.dur = m.pcm.length / m.rate; c.resolve(c.url); }
       nvPump();
     } else if (m.type === "error") {
-      console.warn("voice", m.message);
+      console.warn("voice", m.stage, m.message);
       if (m.id) {
+        nvWatch(0);
         const c = NV.clips.get(m.id);
         NV.busy = null;
         if (c) { NV.clips.delete(m.id); c.reject(new Error(m.message)); }
         nvPump();
-      } else NV.readyReject?.(new Error(m.message));
+      } else nvFailed(new Error(`${m.message} (while ${STAGES[m.stage] || m.stage})`));
     } else if (m.type === "removed") {
       NV.removedResolve?.();
     }
   };
-  w.onerror = (e) => { console.warn("voice worker", e.message); NV.readyReject?.(new Error(e.message || "The voice couldn't start")); };
+  w.onerror = (e) => { e.preventDefault?.(); nvFailed(new Error(e.message || "the voice engine crashed")); };
   return w;
 }
-// start the model (downloading it first if needed); resolves once it can speak
+// a watchdog: if the worker goes quiet for too long it has stalled (or the phone killed it for memory)
+function nvWatch(ms, what) {
+  clearTimeout(NV.watch);
+  if (ms) NV.watch = setTimeout(() => nvStalled(what), ms);
+}
+function nvRestart() {
+  nvWatch(0);
+  NV.worker?.terminate();
+  NV.worker = null; NV.ready = null; NV.busy = null;
+  for (const c of NV.clips.values()) if (!c.url) c.sent = false;
+}
+function nvStalled(what) {
+  console.warn("voice stalled:", what, NV.stage, "threads", nvThreads());
+  if (nvThreads() > 1) {
+    // most likely the multi-threaded engine; quietly start again on one thread
+    prefs.set("nvThreads", 1);
+    nvRestart();
+    toast("Restarting the voice in a simpler mode…", 3000);
+    NV.readyRetry?.(); // a start-up still in progress carries on with the new worker…
+    nvPump();          // …and any sentence that was waiting is asked for again
+    return;
+  }
+  nvFailed(new Error(`it stopped responding (during ${what}, at: ${STAGES[NV.stage] || NV.stage})`));
+}
+function nvFailed(e) {
+  nvRestart();
+  NV.lastError = e.message;
+  NV.readyReject?.(e);
+  for (const [k, c] of NV.clips) if (!c.url) { NV.clips.delete(k); c.reject(e); }
+  nvStatus();
+}
+// start the model (downloading it first if needed); resolves once it has spoken a test sentence
 function nvReady() {
   if (!NV.ready) {
-    NV.ready = new Promise((res, rej) => { NV.readyResolve = res; NV.readyReject = rej; });
-    NV.ready.catch(() => { NV.ready = null; });
-    nvWorker().postMessage({ type: "load" });
+    const p = (NV.ready = new Promise((res, rej) => {
+      NV.readyResolve = res; NV.readyReject = rej;
+      // after a fallback restart, the same promise carries on with the new worker
+      NV.readyRetry = () => { NV.ready = p; nvWorker().postMessage({ type: "load", threads: nvThreads() }); };
+    }));
+    p.then(() => { NV.readyRetry = null; }, () => { NV.ready = null; NV.readyRetry = null; });
+    nvWorker().postMessage({ type: "load", threads: nvThreads() });
   }
   return NV.ready;
+}
+function nvStatus() {
+  const el = $("#nv-status");
+  if (!el) return;
+  const ready = NV.stage === "ready" && NV.worker;
+  el.textContent = NV.lastError && !ready ? "Last problem: " + NV.lastError
+    : ready ? `Voice ready · ${NV.threads > 1 ? NV.threads + " cores" : "1 core"}`
+    : NV.worker && NV.stage !== "download" ? `Getting ready: ${STAGES[NV.stage] || NV.stage}…` : "";
+  el.hidden = !el.textContent;
 }
 async function nvDownload() {
   if (NV.downloading) return;
@@ -1078,7 +1139,11 @@ function nvPump() {
   const c = NV.clips.get(key);
   c.sent = true;
   NV.busy = key;
-  nvReady().then(() => nvWorker().postMessage({ type: "speak", id: key, text: c.text, voice: key.split("|")[1] }), (e) => {
+  nvReady().then(() => {
+    if (NV.busy !== key) return;
+    nvWatch(45000 + c.text.length * 300, "a sentence");
+    nvWorker().postMessage({ type: "speak", id: key, text: c.text, voice: key.split("|")[1] });
+  }, (e) => {
     NV.busy = null;
     for (const [k, x] of NV.clips) if (!x.url) { NV.clips.delete(k); x.reject(e); }
   });
@@ -1145,6 +1210,7 @@ function renderVoiceUI() {
   if (!NV.downloading) $("#nv-progress i").style.width = "0";
   $("#nv-voice").hidden = !NV.downloaded;
   $("#nv-remove").hidden = !NV.downloaded;
+  nvStatus();
   $("#nv-voice").innerHTML = NV_VOICES.map(([k, label]) => `<option value="${k}"${k === nvVoice() ? " selected" : ""}>${esc(label)}</option>`).join("");
 }
 nvCheck();
@@ -1357,11 +1423,12 @@ async function nvSpeakCurrent() {
   nvPlan();
   setBuffering(!c.url);
   updatePlayer();
+  if (!c.url && NV.stage !== "ready") toast("Getting the voice ready — the first sentence can take a moment", 4000);
   let url;
   try { url = await c.promise; } catch (e) {
     if (gen !== T.gen || !T.playing) return;
     ttsPause();
-    toast("Couldn't read this aloud: " + e.message, 4500);
+    toast("The natural voice didn't work: " + e.message + ". You can switch to Device voices in Aa.", 7000);
     return;
   }
   if (gen !== T.gen || !T.playing) return;

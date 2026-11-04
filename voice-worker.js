@@ -3,8 +3,11 @@
 // which (unlike the built-in speech API) keeps playing while another app is open or the screen is locked.
 //
 // The model (~92 MB) is downloaded once from Hugging Face and kept in Cache Storage. Everything else is in
-// the repo under vendor/. Messages in:  {type:"load"}  {type:"speak", id, text, voice}  {type:"remove"}
-// Messages out: {type:"progress", loaded, total}  {type:"ready"}  {type:"audio", id, pcm}  {type:"error", id?, message}
+// the repo under vendor/.
+// Messages in:  {type:"load", threads}  {type:"speak", id, text, voice}  {type:"remove"}
+// Messages out: {type:"progress", loaded, total}  {type:"stage", stage}  {type:"ready", threads}
+//               {type:"audio", id, pcm}  {type:"error", id?, message, stage}
+// "stage" says how far start-up got, so the app can tell a stall apart from a slow phone and say where it stuck.
 import * as ort from "./vendor/ort/ort.wasm.min.mjs";
 import { phonemize } from "./vendor/phonemizer/phonemizer.js";
 
@@ -14,9 +17,13 @@ const CACHE = "shelf-voice";
 const SAMPLE_RATE = 24000;
 
 ort.env.wasm.wasmPaths = new URL("./vendor/ort/", import.meta.url).href;
-ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
 
-let session = null, vocab = null, loading = null;
+let session = null, vocab = null, loading = null, stage = "starting";
+const setStage = (post, st) => { stage = st; post({ type: "stage", stage: st }); };
+// anything that escapes a handler still reaches the app instead of failing silently
+const fail = (e) => self.postMessage({ type: "error", message: String(e?.message || e || "unknown error"), stage });
+self.addEventListener("error", (e) => fail(e.message || e.error));
+self.addEventListener("unhandledrejection", (e) => fail(e.reason));
 const styles = new Map();
 
 // ---- download the model once, with progress, then keep it in Cache Storage
@@ -45,14 +52,24 @@ async function modelBytes(post) {
   return bytes;
 }
 
-async function load(post) {
+async function load(post, threads = 1) {
   if (session) return;
   if (!loading) {
     loading = (async () => {
+      // several threads only where the page is cross-origin isolated and the app asked for them
+      ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.max(1, Math.min(4, threads)) : 1;
+      setStage(post, "download");
       vocab = await (await fetch(new URL("./vendor/kokoro/vocab.json", import.meta.url))).json();
       const bytes = await modelBytes(post);
-      session = await ort.InferenceSession.create(bytes, { executionProviders: ["wasm"], graphOptimizationLevel: "all" });
-    })().catch((e) => { loading = null; throw e; });
+      setStage(post, "engine");
+      const s = await ort.InferenceSession.create(bytes, { executionProviders: ["wasm"], graphOptimizationLevel: "all" });
+      // prove the whole chain works (text → phonemes → model → audio) before saying we're ready
+      setStage(post, "test");
+      session = s;
+      const test = await speak({ text: "Ready.", voice: "af_heart" });
+      if (!test.length) throw new Error("the voice produced no sound");
+      setStage(post, "ready");
+    })().catch((e) => { loading = null; session = null; throw e; });
   }
   await loading;
 }
@@ -121,7 +138,7 @@ async function speak({ text, voice }) {
 self.onmessage = async ({ data: m }) => {
   const post = (x, t) => self.postMessage(x, t || []);
   try {
-    if (m.type === "load") { await load(post); post({ type: "ready" }); }
+    if (m.type === "load") { await load(post, m.threads); post({ type: "ready", threads: ort.env.wasm.numThreads }); }
     else if (m.type === "speak") {
       await load(post);
       const pcm = await speak(m);
@@ -132,6 +149,6 @@ self.onmessage = async ({ data: m }) => {
       post({ type: "removed" });
     }
   } catch (e) {
-    post({ type: "error", id: m.id, message: String(e?.message || e) });
+    post({ type: "error", id: m.id, message: String(e?.message || e), stage });
   }
 };
