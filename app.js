@@ -959,8 +959,12 @@ const NV_VOICES = [
   ["am_michael", "Michael · US, male"], ["am_fenrir", "Fenrir · US, male, deep"],
   ["bf_emma", "Emma · British"], ["bm_george", "George · British, male"],
 ];
+// Bump with every change to voice-worker.js: it's stored with the voice for offline use, and the version in its
+// address is what makes a phone fetch the new one instead of running the stored copy forever.
+const NV_REV = 7;
+const NV_WORKER = `voice-worker.js?v=${NV_REV}`;
 const NV_FILES = [
-  "voice-worker.js", "vendor/ort/ort.wasm.min.mjs", "vendor/ort/ort-wasm-simd-threaded.mjs", "vendor/ort/ort-wasm-simd-threaded.wasm",
+  NV_WORKER, "vendor/ort/ort.wasm.min.mjs", "vendor/ort/ort-wasm-simd-threaded.mjs", "vendor/ort/ort-wasm-simd-threaded.wasm",
   "vendor/phonemizer/phonemizer.js", "vendor/kokoro/vocab.json", ...NV_VOICES.map(([v]) => `vendor/kokoro/voices/${v}.bin`),
 ];
 const NV_MODEL = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx";
@@ -978,7 +982,12 @@ const nvVoice = () => { const v = prefs.get("nvVoice", "af_heart"); return NV_VO
 const nvKey = (page, idx) => `${T.bookId}|${nvVoice()}|${page}|${idx}`;
 
 async function nvCheck() {
-  try { NV.downloaded = !!(await (await caches.open("shelf-voice")).match(NV_MODEL)); } catch { NV.downloaded = false; }
+  try {
+    const c = await caches.open("shelf-voice");
+    NV.downloaded = !!(await c.match(NV_MODEL));
+    // drop stored copies of older voice code
+    for (const r of await c.keys()) if (/\/voice-worker\.js/.test(r.url) && !r.url.endsWith(NV_WORKER)) c.delete(r);
+  } catch { NV.downloaded = false; }
   renderVoiceUI();
 }
 // How many CPU threads to try. Threads make the voice faster but need cross-origin isolation, and they can stall
@@ -989,7 +998,7 @@ const nvThreads = () => (self.crossOriginIsolated ? prefs.get("nvThreads", IOS ?
 const STAGES = { starting: "starting", download: "downloading the voice", load: "loading the voice", engine: "starting the voice engine", test: "a test sentence", ready: "ready" };
 function nvWorker() {
   if (NV.worker) return NV.worker;
-  const w = (NV.worker = new Worker("voice-worker.js", { type: "module" }));
+  const w = (NV.worker = new Worker(NV_WORKER, { type: "module" }));
   NV.stage = "starting";
   w.onmessage = ({ data: m }) => {
     if (m.type === "progress") {

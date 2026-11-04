@@ -1,7 +1,7 @@
 // Shelf service worker. Everything the app needs is stored at install, so it opens with no network.
 // Books themselves live in IndexedDB (see app.js), not here. Bump VERSION on every deploy.
 // The natural voice (model + its runtime) lives in its own cache, "shelf-voice", which survives updates.
-const VERSION = "shelf-v6"; // v2: read aloud · v3: natural voice · v4: updates skip the browser cache · v5: voice start-up checks · v6: progress bar
+const VERSION = "shelf-v7"; // v2: read aloud · v3: natural voice · v4: updates skip the browser cache · v5: voice start-up checks · v6: progress bar · v7: versioned voice code
 importScripts("precache.js");
 
 self.addEventListener("install", (e) => {
@@ -41,9 +41,16 @@ self.addEventListener("fetch", (e) => {
   // hosted PDFs go straight to the network — the app copies them into IndexedDB itself
   if (url.pathname.includes("/books/") && url.pathname.endsWith(".pdf")) return;
 
-  // the natural voice's code: from its own cache once downloaded (no copy in the app cache, no re-checks)
+  // the natural voice's code, kept with the voice so it works offline. The match is exact, query included:
+  // voice-worker.js is asked for as voice-worker.js?v=N, so a new app version never runs an old stored copy.
   if (/\/(voice-worker\.js|vendor\/(ort|phonemizer|kokoro)\/)/.test(url.pathname)) {
-    e.respondWith(caches.open("shelf-voice").then((c) => c.match(req, { ignoreSearch: true })).then((hit) => (hit ? isolate(hit) : fetch(req).then(isolate))));
+    e.respondWith(caches.open("shelf-voice").then(async (c) => {
+      const hit = await c.match(req);
+      if (hit) return isolate(hit);
+      const res = await fetch(req);
+      if (res.ok && url.search) c.put(req, res.clone()).catch(() => {});
+      return isolate(res);
+    }));
     return;
   }
 
