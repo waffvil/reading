@@ -986,16 +986,19 @@ async function nvCheck() {
 // iPhone/iPad start on one thread: that's where the multi-threaded engine has been seen to stall.
 const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 const nvThreads = () => (self.crossOriginIsolated ? prefs.get("nvThreads", IOS ? 1 : Math.min(4, navigator.hardwareConcurrency || 2)) : 1);
-const STAGES = { starting: "starting", download: "loading the voice file", engine: "starting the voice engine", test: "a test sentence", ready: "ready" };
+const STAGES = { starting: "starting", download: "downloading the voice", load: "loading the voice", engine: "starting the voice engine", test: "a test sentence", ready: "ready" };
 function nvWorker() {
   if (NV.worker) return NV.worker;
   const w = (NV.worker = new Worker("voice-worker.js", { type: "module" }));
   NV.stage = "starting";
   w.onmessage = ({ data: m }) => {
     if (m.type === "progress") {
-      const bar = $("#nv-progress i");
-      if (bar) bar.style.width = Math.round((m.loaded / m.total) * 100) + "%";
-      $("#nv-download").textContent = `Downloading… ${Math.round(m.loaded / 1e6)} of ${Math.round(m.total / 1e6)} MB`;
+      NV.loadFrac = m.loaded / m.total;
+      if (m.phase === "download") {
+        const bar = $("#nv-progress i");
+        if (bar) bar.style.width = Math.round(NV.loadFrac * 100) + "%";
+        $("#nv-download").textContent = `Downloading… ${Math.round(m.loaded / 1e6)} of ${Math.round(m.total / 1e6)} MB`;
+      }
     } else if (m.type === "stage") {
       NV.stage = m.stage;
       // the download can take minutes; the rest should be quick, so time it from here
@@ -1010,7 +1013,17 @@ function nvWorker() {
       nvWatch(0);
       const c = NV.clips.get(m.id);
       NV.busy = null;
-      if (c) { c.url = URL.createObjectURL(wavBlob(m.pcm, m.rate)); c.dur = m.pcm.length / m.rate; c.resolve(c.url); }
+      if (c) {
+        c.url = URL.createObjectURL(wavBlob(m.pcm, m.rate)); c.dur = m.pcm.length / m.rate;
+        // learn how fast this phone makes speech, so the progress bar's estimate gets better
+        const ms = performance.now() - (c.sentAt || performance.now());
+        if (c.text.length > 20 && ms > 0) {
+          const old = prefs.get("nvMsPerChar", 0), now = ms / c.text.length;
+          prefs.set("nvMsPerChar", old ? old * 0.7 + now * 0.3 : now);
+          NV.speed = NV.speed ? NV.speed * 0.7 + (c.dur * 1000 / ms) * 0.3 : c.dur * 1000 / ms;
+        }
+        c.resolve(c.url);
+      }
       nvPump();
     } else if (m.type === "error") {
       console.warn("voice", m.stage, m.message);
@@ -1077,7 +1090,9 @@ function nvStatus() {
   if (!el) return;
   const ready = NV.stage === "ready" && NV.worker;
   el.textContent = NV.lastError && !ready ? "Last problem: " + NV.lastError
-    : ready ? `Voice ready · ${NV.threads > 1 ? NV.threads + " cores" : "1 core"}`
+    : ready ? `Voice ready · ${NV.threads > 1 ? NV.threads + " cores" : "1 core"}` + (NV.speed
+      ? NV.speed >= 1.1 ? ` · speaks ${NV.speed.toFixed(1)}× faster than it reads` : ` · slower than real time (${NV.speed.toFixed(1)}×), so expect short pauses`
+      : "")
     : NV.worker && NV.stage !== "download" ? `Getting ready: ${STAGES[NV.stage] || NV.stage}…` : "";
   el.hidden = !el.textContent;
 }
@@ -1142,6 +1157,7 @@ function nvPump() {
   nvReady().then(() => {
     if (NV.busy !== key) return;
     nvWatch(45000 + c.text.length * 300, "a sentence");
+    c.sentAt = performance.now();
     nvWorker().postMessage({ type: "speak", id: key, text: c.text, voice: key.split("|")[1] });
   }, (e) => {
     NV.busy = null;
@@ -1423,7 +1439,6 @@ async function nvSpeakCurrent() {
   nvPlan();
   setBuffering(!c.url);
   updatePlayer();
-  if (!c.url && NV.stage !== "ready") toast("Getting the voice ready — the first sentence can take a moment", 4000);
   let url;
   try { url = await c.promise; } catch (e) {
     if (gen !== T.gen || !T.playing) return;
@@ -1445,7 +1460,35 @@ async function nvSpeakCurrent() {
     toast("Tap play to keep listening");
   });
 }
-function setBuffering(on) { $("#player").classList.toggle("buffering", on && T.playing); }
+function setBuffering(on) {
+  on = on && T.playing;
+  $("#player").classList.toggle("buffering", on);
+  clearInterval(NV.progTimer);
+  if (on) { NV.waitStart = performance.now(); NV.progTimer = setInterval(drawProgress, 250); drawProgress(); }
+  else $("#tts-status").hidden = true;
+}
+// what the voice is doing while you wait, as a label and a bar (an estimate once it knows the phone's speed)
+function drawProgress() {
+  const box = $("#tts-status");
+  if (!T.playing || engine() !== "natural") { box.hidden = true; return clearInterval(NV.progTimer); }
+  const c = NV.clips.get(nvKey(T.page, T.idx));
+  const secs = Math.round((performance.now() - NV.waitStart) / 1000);
+  let label, frac = null;
+  if (NV.stage === "download" || NV.stage === "load") { label = NV.stage === "load" ? "Loading the voice" : "Downloading the voice"; frac = NV.loadFrac || 0; }
+  else if (NV.stage === "starting") label = "Getting ready";
+  else if (NV.stage === "engine") label = "Starting the voice engine";
+  else if (NV.stage === "test") label = "Warming up";
+  else {
+    label = "Preparing the next sentence";
+    const per = prefs.get("nvMsPerChar", 0);
+    if (c?.sentAt && per) frac = Math.min(0.96, (performance.now() - c.sentAt) / (per * c.text.length));
+  }
+  box.hidden = false;
+  box.querySelector(".tts-status-label").textContent = frac === null ? `${label}… ${secs ? secs + " s" : ""}` : `${label}… ${Math.round(frac * 100)}%`;
+  const bar = box.querySelector("i");
+  box.classList.toggle("indeterminate", frac === null);
+  bar.style.width = frac === null ? "" : Math.round(frac * 100) + "%";
+}
 
 async function advance() {
   T.idx++;

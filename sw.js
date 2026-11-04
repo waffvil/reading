@@ -1,7 +1,7 @@
 // Shelf service worker. Everything the app needs is stored at install, so it opens with no network.
 // Books themselves live in IndexedDB (see app.js), not here. Bump VERSION on every deploy.
 // The natural voice (model + its runtime) lives in its own cache, "shelf-voice", which survives updates.
-const VERSION = "shelf-v5"; // v2: read aloud · v3: natural voice · v4: updates skip the browser cache · v5: voice start-up checks
+const VERSION = "shelf-v6"; // v2: read aloud · v3: natural voice · v4: updates skip the browser cache · v5: voice start-up checks · v6: progress bar
 importScripts("precache.js");
 
 self.addEventListener("install", (e) => {

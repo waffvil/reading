@@ -27,13 +27,8 @@ self.addEventListener("unhandledrejection", (e) => fail(e.reason));
 const styles = new Map();
 
 // ---- download the model once, with progress, then keep it in Cache Storage
-async function modelBytes(post) {
-  const cache = await caches.open(CACHE);
-  const hit = await cache.match(MODEL_URL);
-  if (hit) return new Uint8Array(await hit.arrayBuffer());
-  const res = await fetch(MODEL_URL);
-  if (!res.ok) throw new Error(`Download failed (${res.status})`);
-  const total = +res.headers.get("content-length") || 92361116;
+// read a response body in chunks so the app can show how far along it is ("download" or "load" from storage)
+async function readAll(res, total, phase, post) {
   const reader = res.body.getReader();
   const buf = new Uint8Array(total);
   let loaded = 0, parts = null, lastPost = 0;
@@ -43,12 +38,24 @@ async function modelBytes(post) {
     if (!parts && loaded + value.length <= buf.length) buf.set(value, loaded);
     else { parts ||= [buf.subarray(0, loaded)]; parts.push(value); } // content-length was wrong; fall back
     loaded += value.length;
-    if (Date.now() - lastPost > 150) { post({ type: "progress", loaded, total }); lastPost = Date.now(); }
+    if (Date.now() - lastPost > 150) { post({ type: "progress", phase, loaded, total }); lastPost = Date.now(); }
   }
-  post({ type: "progress", loaded, total: loaded });
-  const bytes = parts ? new Uint8Array(await new Blob(parts).arrayBuffer()) : buf.subarray(0, loaded);
+  post({ type: "progress", phase, loaded, total: loaded });
+  return parts ? new Uint8Array(await new Blob(parts).arrayBuffer()) : buf.subarray(0, loaded);
+}
+async function modelBytes(post) {
+  const cache = await caches.open(CACHE);
+  const hit = await cache.match(MODEL_URL);
+  if (hit) {
+    setStage(post, "load");
+    return readAll(hit, +hit.headers.get("content-length") || 92361116, "load", post);
+  }
+  setStage(post, "download");
+  const res = await fetch(MODEL_URL);
+  if (!res.ok) throw new Error(`Download failed (${res.status})`);
+  const bytes = await readAll(res, +res.headers.get("content-length") || 92361116, "download", post);
   if (bytes.length < 50e6) throw new Error("Download was incomplete — try again on Wi-Fi");
-  await cache.put(MODEL_URL, new Response(bytes, { headers: { "content-type": "application/octet-stream" } }));
+  await cache.put(MODEL_URL, new Response(bytes, { headers: { "content-type": "application/octet-stream", "content-length": String(bytes.length) } }));
   return bytes;
 }
 
@@ -58,7 +65,6 @@ async function load(post, threads = 1) {
     loading = (async () => {
       // several threads only where the page is cross-origin isolated and the app asked for them
       ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.max(1, Math.min(4, threads)) : 1;
-      setStage(post, "download");
       vocab = await (await fetch(new URL("./vendor/kokoro/vocab.json", import.meta.url))).json();
       const bytes = await modelBytes(post);
       setStage(post, "engine");
