@@ -1,8 +1,11 @@
 // Shelf natural voice: the Kokoro-82M text-to-speech model, run on the phone itself (ONNX Runtime).
-// Two ways to run it: on the graphics chip (WebGPU, full-precision model) where the phone offers it, many times
-// faster; otherwise on the processor (WebAssembly, 8-bit model). A failed GPU start falls back to the processor.
-// (Tested on WebGPU: the half-precision and uint8 builds of the model come out as silence or NaN after a couple of
-// seconds, and the 8-bit build falls back to the processor; only the full-precision build works there.)
+// One model file (models/kokoro-w8.onnx, 83 MB): the weights are stored in 8 bits and turned back into full
+// precision when the model loads, so all the arithmetic is full precision. That runs on the graphics chip
+// (WebGPU) where the phone offers it, or on the processor (WebAssembly) otherwise; a failed GPU start falls back
+// to the processor. Measured on an Apple M2, against the published builds: ~4× faster than speech on the GPU
+// (same as the 326 MB full-precision build), 1.9× on the processor (the published 92 MB 8-bit build: 1.1×), and
+// closer in sound to the full-precision build than the 92 MB one is. (The published fp16 / uint8 builds go
+// silent or NaN on WebGPU, and the 92 MB one can't use the GPU at all.) scripts/kokoro-w8.py makes the file.
 // It turns a passage of one to a few sentences into 24 kHz audio, and says how many phonemes each sentence
 // took, so the app can tell where in the audio each sentence starts. The main thread plays that through an ordinary <audio> element,
 // which (unlike the built-in speech API) keeps playing while another app is open or the screen is locked.
@@ -16,12 +19,10 @@
 import "./vendor/stream-iterator.js"; // first: the phonemizer needs it while it loads (Safari)
 import { phonemize } from "./vendor/phonemizer/phonemizer.js";
 
-const HF = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/";
-const MODELS = {
-  cpu: new URL(import.meta.url).searchParams.get("model") || HF + "model_quantized.onnx", // ?model= is for local testing only
-  gpu: HF + "model.onnx",
-};
-const MIN_BYTES = { cpu: 50e6, gpu: 250e6 }, GUESS = { cpu: 92361116, gpu: 325532387 };
+const MODEL = new URL(import.meta.url).searchParams.get("model") || // ?model= is for local testing only
+  new URL("./models/kokoro-w8.onnx", import.meta.url).href;
+const MODELS = { cpu: MODEL, gpu: MODEL }; // the same file runs either way
+const MIN_BYTES = { cpu: 70e6, gpu: 70e6 }, GUESS = { cpu: 83074803, gpu: 83074803 };
 const CACHE = "shelf-voice";
 const SAMPLE_RATE = 24000;
 

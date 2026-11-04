@@ -13,11 +13,10 @@ A free, offline PDF reader for your phone. A home-screen app, hosted on GitHub P
   - **Natural** (recommended): lifelike voices that run on the phone itself. They **keep reading when you
     switch apps or lock the screen**, with lock-screen and headphone controls, like an audiobook. Tap ▶ next
     to any voice to hear a preview before downloading it; once downloaded it works offline.
-    - **Most natural** (Kokoro): eleven voices (nine American) sharing one download. Where the phone's graphics
-      chip can run it (WebGPU: iOS 26, recent Chrome), Kokoro runs there in full precision: a 326 MB download,
-      several times faster than speech, so it reads continuously and prepares minutes ahead. Elsewhere it runs
-      on the processor (92 MB) and may pause between sentences. Phones that already have the 92 MB version are
-      offered the faster one in Aa.
+    - **Most natural** (Kokoro): eleven voices (nine American) sharing one 83 MB download. It runs on the phone's
+      graphics chip where it can (WebGPU: iOS 26, recent Chrome), several times faster than speech, so it reads
+      continuously and prepares minutes ahead; otherwise on the processor. Phones with an earlier Kokoro
+      download are offered the update in Aa, and the old copy is removed.
     - **Fast** (Piper): sixteen American and British voices, 63 MB each, downloaded one at a time. Lighter, a
       little less lifelike.
 
@@ -60,12 +59,21 @@ After changing any shipped file, bump `VERSION` in `sw.js` so phones pick up the
 `scripts/precache.sh` if you add files the app needs offline.
 
 ### Natural voice internals
-`voice-worker.js` runs [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (Apache-2.0, from
-`onnx-community/Kokoro-82M-v1.0-ONNX`): `model.onnx` on WebGPU (`vendor/ort-gpu/`, the ONNX Runtime WebGPU
-build), `model_quantized.onnx` on WebAssembly otherwise. Measured on WebGPU (Apple M2): the fp16, q4f16 and
-uint8 builds come out silent or NaN after ~2.7 s, and the 8-bit build falls back to the CPU, so only fp32 is
-used there; the worker's start-up test reads a whole sentence and checks speech reaches its end, and falls
-back to the processor if not. `piper-worker.js` runs [Piper](https://github.com/rhasspy/piper)
+`voice-worker.js` runs [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (Apache-2.0) from
+`models/kokoro-w8.onnx`, made by `scripts/kokoro-w8.py` from `onnx-community/Kokoro-82M-v1.0-ONNX`'s
+`model.onnx`: weights stored as int8 with a per-channel scale and a `DequantizeLinear` in front of each, so the
+file is 83 MB but all arithmetic is float32. It runs on WebGPU (`vendor/ort-gpu/`) or WebAssembly (`vendor/ort/`).
+Measured in Chrome on an Apple M2:
+
+| build | size | WebGPU | WebAssembly | sound vs fp32 (log-mel DTW) |
+|---|---|---|---|---|
+| fp32 `model.onnx` | 326 MB | ~4× real time | — | 0 |
+| **int8 weights, fp32 math (ours)** | **83 MB** | **~4×** | **1.9×** | **0.28** |
+| 8-bit `model_quantized.onnx` | 92 MB | 0.14× (falls back to CPU) | 1.1× | 0.40 |
+| fp16 / uint8 builds | 163 / 178 MB | silent or NaN after ~2.7 s | — | — |
+
+The worker's start-up test on the GPU reads a whole sentence and checks speech reaches its end, and falls back
+to the processor if not. `piper-worker.js` runs [Piper](https://github.com/rhasspy/piper)
 voices (from `rhasspy/piper-voices`, each with its own license listed there). Both use ONNX Runtime Web (MIT,
 `vendor/ort/`) and turn text into phonemes with `phonemizer` (`vendor/phonemizer/`, which bundles eSpeak NG,
 GPL-3.0). `vendor/stream-iterator.js` adds a stream feature Safari lacks, which the phonemizer needs.

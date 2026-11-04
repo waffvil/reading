@@ -1031,20 +1031,21 @@ const VOICES = [
   { id: "bm_george", fam: "kokoro", name: "George", desc: "British · male" },
 ];
 const KOKORO_N = () => VOICES.filter((v) => v.fam === "kokoro").length;
-const sizeOf = (v) => (v.fam === "piper" ? "63 MB" : `${NV.gpu ? "326" : "92"} MB, shared by all ${KOKORO_N()}`);
+const sizeOf = (v) => (v.fam === "piper" ? "63 MB" : `83 MB, shared by all ${KOKORO_N()}`);
 // Bump with every change to voice-worker.js or piper-worker.js: they're stored with the voices for offline use,
 // and the version in their address is what makes a phone fetch the new one instead of running a stored copy.
-const NV_REV = 12;
+const NV_REV = 13;
 const NV_WORKERS = { kokoro: `voice-worker.js?v=${NV_REV}`, piper: `piper-worker.js?v=${NV_REV}` };
 const NV_FILES = [
   ...Object.values(NV_WORKERS), "vendor/ort/ort.wasm.min.mjs", "vendor/ort/ort-wasm-simd-threaded.mjs", "vendor/ort/ort-wasm-simd-threaded.wasm",
   "vendor/phonemizer/phonemizer.js", "vendor/stream-iterator.js", "vendor/kokoro/vocab.json",
   ...VOICES.filter((v) => v.fam === "kokoro").map((v) => `vendor/kokoro/voices/${v.id}.bin`),
 ];
-const NV_MODEL = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx";
-// the same voice in full precision, for the graphics chip (WebGPU): many times faster than NV_MODEL on the processor.
-// (The half-precision build is smaller but goes silent after a couple of seconds on WebGPU.)
-const NV_MODEL_GPU = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx";
+// Kokoro: one 83 MB file that runs on the graphics chip or the processor (see voice-worker.js)
+const NV_MODEL = new URL("models/kokoro-w8.onnx", location.href).href;
+// earlier Kokoro downloads (92 MB processor build, 326 MB / 163 MB graphics-chip builds): removed once the
+// new file is in place
+const KOKORO_OLD = ["model_quantized.onnx", "model.onnx", "model_fp16.onnx"].map((f) => "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/" + f);
 const NV_GPU_FILES = ["vendor/ort-gpu/ort.webgpu.min.mjs", "vendor/ort-gpu/ort-wasm-simd-threaded.jsep.mjs", "vendor/ort-gpu/ort-wasm-simd-threaded.jsep.wasm"];
 const PIPER = "https://huggingface.co/rhasspy/piper-voices/resolve/main/";
 // "en_US-lessac-medium" → en/en_US/lessac/medium/ (same rule as piper-worker.js)
@@ -1069,10 +1070,10 @@ NV.audio.preload = "auto";
 NV.audio.setAttribute("playsinline", "");
 const nvVoice = () => { const v = prefs.get("nvVoice", "af_heart"); return voiceOf(v) ? v : "af_heart"; };
 const nvCur = () => voiceOf(nvVoice());
-const voiceReady = (v) => (v.fam === "kokoro" ? NV.have.has(NV_MODEL) || NV.have.has(NV_MODEL_GPU) : NV.have.has(modelOf(v)));
-// Kokoro runs on the graphics chip where it can — unless only the processor model is on the phone and the reader
-// hasn't asked for the faster one (that's a second, bigger download)
-const kokoroDevice = () => (NV.gpu && (NV.have.has(NV_MODEL_GPU) || !NV.have.has(NV_MODEL) || prefs.get("kokoroGpu", false)) ? "gpu" : "cpu");
+const voiceReady = (v) => NV.have.has(modelOf(v));
+// Kokoro runs on the graphics chip where it can (same file either way)
+const kokoroDevice = () => (NV.gpu ? "gpu" : "cpu");
+const kokoroOld = () => KOKORO_OLD.some((u) => NV.have.has(u));
 const deviceFor = (v) => (v.fam === "kokoro" ? kokoroDevice() : "cpu");
 // one worker per model: all Kokoro voices share one, each Piper voice has its own
 const workerKeyOf = (v) => (v.fam === "kokoro" ? "kokoro" : v.id);
@@ -1081,7 +1082,8 @@ async function nvCheck() {
   try {
     const c = await caches.open("shelf-voice");
     NV.have = new Set();
-    for (const m of new Set([...VOICES.map(modelOf), NV_MODEL_GPU])) if (await c.match(m)) NV.have.add(m);
+    for (const m of new Set([...VOICES.map(modelOf), ...KOKORO_OLD])) if (await c.match(m)) NV.have.add(m);
+    if (NV.have.has(NV_MODEL)) nvDropOld();
     // drop stored copies of older voice code
     const current = Object.values(NV_WORKERS);
     for (const r of await c.keys()) if (/\/(voice|piper)-worker\.js/.test(r.url) && !current.some((w) => r.url.endsWith(w))) c.delete(r);
@@ -1120,6 +1122,7 @@ function nvWorker() {
       NV.threads = m.threads;
       NV.device = m.device || "cpu";
       if (m.model) NV.have.add(m.model);
+      if (m.model === NV_MODEL) nvDropOld();
       NV.readyResolve?.();
       nvStatus();
     } else if (m.type === "audio") {
@@ -1172,6 +1175,13 @@ function nvWorker() {
 function nvWatch(ms, what) {
   clearTimeout(NV.watch);
   if (ms) NV.watch = setTimeout(() => nvStalled(what), ms);
+}
+// the new Kokoro file is on the phone: free the space the earlier downloads took
+async function nvDropOld() {
+  if (!kokoroOld()) return;
+  try { const c = await caches.open("shelf-voice"); for (const u of KOKORO_OLD) { await c.delete(u); NV.have.delete(u); } } catch {}
+  renderVoiceUI();
+  renderStorage?.();
 }
 function nvRestart() {
   nvWatch(0);
@@ -1285,10 +1295,10 @@ async function nvRemoveVoice(id) {
     const c = await caches.open("shelf-voice");
     await c.delete(modelOf(v));
     if (v.fam === "piper") await c.delete(modelOf(v) + ".json");
-    if (v.fam === "kokoro") await c.delete(NV_MODEL_GPU);
+    if (v.fam === "kokoro") for (const u of KOKORO_OLD) await c.delete(u);
   } catch {}
   NV.have.delete(modelOf(v));
-  if (v.fam === "kokoro") { NV.have.delete(NV_MODEL_GPU); prefs.set("kokoroGpu", false); }
+  if (v.fam === "kokoro") KOKORO_OLD.forEach((u) => NV.have.delete(u));
   renderVoiceUI();
   renderStorage?.();
 }
@@ -1506,12 +1516,11 @@ function renderVoiceUI() {
   $("#nv-box").hidden = eng !== "natural";
   $("#sys-box").hidden = eng !== "system";
   $("#vl-piper").innerHTML = VOICES.filter((v) => v.fam === "piper").map(voiceRow).join("");
-  // Kokoro already on the phone in the processor version, and this phone has a graphics chip that can run it:
-  // offer the faster version
-  const up = NV.gpu && NV.have.has(NV_MODEL) && !NV.have.has(NV_MODEL_GPU);
-  $("#vl-kokoro").innerHTML = (up ? `<div class="gpu-up"><div><b>Make these voices play smoothly.</b> This phone can run them on its graphics chip, many times faster, so they keep up without pauses. One 326 MB download (Wi-Fi recommended).</div><button class="btn small primary" data-act="gpu"${NV.downloading ? " disabled" : ""}>Download</button></div>` : "")
+  // an earlier Kokoro download is on the phone: offer the new, smaller, faster file (the old one is then removed)
+  const up = kokoroOld() && !NV.have.has(NV_MODEL);
+  $("#vl-kokoro").innerHTML = (up ? `<div class="gpu-up"><div><b>Update for these voices:</b> smaller (83 MB), faster and closer to the original voice. Your old copy is removed once it's done.</div><button class="btn small primary" data-act="update"${NV.downloading ? " disabled" : ""}>Update</button></div>` : "")
     + VOICES.filter((v) => v.fam === "kokoro").map(voiceRow).join("");
-  $("#kokoro-label").textContent = NV.gpu && kokoroDevice() === "gpu" ? "Most natural · smooth on this phone" : "Most natural · may pause between sentences on a phone";
+  $("#kokoro-label").textContent = NV.gpu ? "Most natural · smooth on this phone" : "Most natural";
   nvStatus();
 }
 nvCheck();
@@ -1833,7 +1842,7 @@ async function advance() {
 
 async function ttsPlay() {
   const natural = engine() === "natural";
-  if (!natural && prefs.get("engine", "system") === "natural") return toast("Download a natural voice first: Aa → Natural (or pick Device voices)", 4500);
+  if (!natural && prefs.get("engine", "system") === "natural") return toast(nvCur().fam === "kokoro" && kokoroOld() ? "Your voice has an update: Aa → Natural → Update (83 MB)" : "Download a natural voice first: Aa → Natural (or pick Device voices)", 5000);
   if (!natural && !synth) return toast("This browser can't read aloud");
   // iOS only lets sound start inside a tap, so wake the right engine now, before any await
   if (natural) {
@@ -1958,8 +1967,7 @@ $("#seg-engine").addEventListener("click", (e) => {
 });
 $("#nv-box").addEventListener("click", (e) => {
   const b = e.target.closest("[data-act]"), row = e.target.closest(".vrow");
-  if (b?.dataset.act === "gpu") {
-    prefs.set("kokoroGpu", true);
+  if (b?.dataset.act === "update") {
     if (NV.workerKey === "kokoro") nvRestart();
     return nvDownload(nvCur().fam === "kokoro" ? nvVoice() : "af_heart");
   }
