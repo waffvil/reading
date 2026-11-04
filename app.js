@@ -1562,6 +1562,7 @@ setInterval(() => {
 }, 1500);
 
 // ---------------------------------------------------------------- close
+let pendingUpdate = false;
 async function closeReader() {
   if (!R.book) return;
   ttsStop();
@@ -1576,6 +1577,7 @@ async function closeReader() {
   $("#reader").hidden = true;
   $("#library").hidden = false;
   document.title = "Shelf";
+  if (pendingUpdate) return location.reload();
   renderLibrary();
 }
 $("#btn-back").addEventListener("click", () => {
@@ -1586,7 +1588,20 @@ addEventListener("popstate", () => { if (R.book) closeReader(); });
 // ---------------------------------------------------------------- boot
 applyTheme(prefs.get("theme", "auto"));
 matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => applyTheme(prefs.get("theme", "auto")));
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch((e) => console.warn("sw", e));
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).catch((e) => console.warn("sw", e));
+  // a new version took over: reload into it now if nothing's open, otherwise as soon as the book is closed
+  const hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadController) return; // first install, not an update
+    if (R.book) { pendingUpdate = true; return; }
+    location.reload();
+  });
+  // look for updates whenever Shelf comes back to the screen, not only at launch
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) navigator.serviceWorker.getRegistration().then((r) => r?.update()).catch(() => {});
+  });
+}
 
 (async () => {
   try {
