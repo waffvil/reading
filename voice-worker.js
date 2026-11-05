@@ -25,6 +25,7 @@ const MODELS = { cpu: MODEL, gpu: MODEL }; // the same file runs either way
 const MIN_BYTES = { cpu: 70e6, gpu: 70e6 }, GUESS = { cpu: 83074803, gpu: 83074803 };
 const CACHE = "shelf-voice";
 const SAMPLE_RATE = 24000;
+const STYLE_AT = 160; // see speak()
 
 let ort = null, session = null, vocab = null, loading = null, stage = "starting", device = "cpu";
 const setStage = (post, st) => { stage = st; post({ type: "stage", stage: st }); };
@@ -169,7 +170,11 @@ async function speak({ texts, text, voice }) {
   ids.length = Math.min(ids.length, 510);
   if (!ids.length) return { pcm: new Float32Array(0), parts };
   const ref = await style(voice);
-  const s = ref.slice(ids.length * 256, ids.length * 256 + 256);
+  // Kokoro stores ~510 styles per voice, one for each input length, and normally picks the one matching the
+  // passage. Passages vary in length (one sentence, then several), so the delivery changed from one passage to
+  // the next. One fixed style, the one for a typical passage, keeps the voice's tone the same throughout.
+  const at = Math.min(STYLE_AT, ref.length / 256 - 1);
+  const s = ref.slice(at * 256, at * 256 + 256);
   const tokens = BigInt64Array.from([0, ...ids, 0], BigInt);
   const feeds = {
     input_ids: new ort.Tensor("int64", tokens, [1, tokens.length]),

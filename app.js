@@ -1040,7 +1040,7 @@ const KOKORO_N = () => VOICES.filter((v) => v.fam === "kokoro").length;
 const sizeOf = (v) => (v.fam === "piper" ? "63 MB" : `83 MB, shared by all ${KOKORO_N()}`);
 // Bump with every change to voice-worker.js or piper-worker.js: they're stored with the voices for offline use,
 // and the version in their address is what makes a phone fetch the new one instead of running a stored copy.
-const NV_REV = 14;
+const NV_REV = 15;
 const NV_WORKERS = { kokoro: `voice-worker.js?v=${NV_REV}`, piper: `piper-worker.js?v=${NV_REV}` };
 const NV_FILES = [
   ...Object.values(NV_WORKERS), "vendor/ort/ort.wasm.min.mjs", "vendor/ort/ort-wasm-simd-threaded.mjs", "vendor/ort/ort-wasm-simd-threaded.wasm",
@@ -1430,7 +1430,9 @@ async function nvPlan() {
   const want = [];
   let page = T.page, idx = T.idx, sents = T.sents, chars = 0, pages = 0;
   const bookId = T.bookId, gpu = NV.device === "gpu" && nvCur().fam === "kokoro";
-  const maxChars = gpu ? 320 : 220, maxN = gpu ? 4 : 3, horizon = gpu ? 6000 : 1200;
+  // how far ahead to prepare: Kokoro on the processor can be slower than reading, so let it get well ahead
+  // (pausing for a minute builds a cushion); Piper keeps up anyway
+  const maxChars = gpu ? 320 : 220, maxN = gpu ? 4 : 3, horizon = gpu ? 6000 : nvCur().fam === "kokoro" ? 5000 : 1500;
   const hardCap = nvCur().fam === "kokoro" ? 430 : 900;
   const cur = nvClipFor(page, idx);
   if (cur) idx = cur.start;
