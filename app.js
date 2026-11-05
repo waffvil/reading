@@ -341,6 +341,7 @@ async function openBook(id) {
   R.sizes = new Array(book.pages + 1);
   R.toc = null;
   T.cache = new Map();
+  T.raw = new Map();
   T.sents = [];
   T.bookId = null;
   book.lastOpened = Date.now();
@@ -891,6 +892,7 @@ function resetReading() {
   if (T.playing) ttsPause();
   drawTts(null);
   T.cache.clear();
+  T.raw.clear();
   nvClear();
   T.bookId = null;
   T.sents = [];
@@ -1006,7 +1008,7 @@ const VOICES = [
   { id: "en_US-amy-medium", fam: "piper", name: "Amy", desc: "American · female" },
   { id: "en_US-kristin-medium", fam: "piper", name: "Kristin", desc: "American · female · calm" },
   { id: "en_US-hfc_female-medium", fam: "piper", name: "Hannah", desc: "American · female · bright" },
-  { id: "en_US-ljspeech-medium", fam: "piper", name: "Linda", desc: "American · female · audiobook" },
+  { id: "en_US-ljspeech-medium", fam: "piper", name: "Linda", desc: "American · female · audiobook narrator, calm" },
   { id: "en_US-ryan-medium", fam: "piper", name: "Ryan", desc: "American · male" },
   { id: "en_US-joe-medium", fam: "piper", name: "Joe", desc: "American · male · relaxed" },
   { id: "en_US-john-medium", fam: "piper", name: "John", desc: "American · male · deep" },
@@ -1020,21 +1022,25 @@ const VOICES = [
   { id: "en_GB-northern_english_male-medium", fam: "piper", name: "Northern English", desc: "British · male · northern" },
   { id: "af_heart", fam: "kokoro", name: "Heart", desc: "American · female · warm" },
   { id: "af_bella", fam: "kokoro", name: "Bella", desc: "American · female · bright" },
-  { id: "af_nicole", fam: "kokoro", name: "Nicole", desc: "American · female · soft" },
+  { id: "af_nicole", fam: "kokoro", name: "Nicole", desc: "American · female · soft, calm" },
   { id: "am_michael", fam: "kokoro", name: "Michael", desc: "American · male" },
   { id: "am_fenrir", fam: "kokoro", name: "Fenrir", desc: "American · male · deep" },
   { id: "am_puck", fam: "kokoro", name: "Puck", desc: "American · male · lively" },
   { id: "af_sarah", fam: "kokoro", name: "Sarah", desc: "American · female · even" },
   { id: "af_kore", fam: "kokoro", name: "Kore", desc: "American · female · steady" },
-  { id: "af_aoede", fam: "kokoro", name: "Aoede", desc: "American · female · gentle" },
+  { id: "af_aoede", fam: "kokoro", name: "Aoede", desc: "American · female · gentle, calm" },
+  { id: "af_sky", fam: "kokoro", name: "Sky", desc: "American · female · airy, calm" },
+  { id: "af_nova", fam: "kokoro", name: "Nova", desc: "American · female · smooth, calm" },
   { id: "bf_emma", fam: "kokoro", name: "Emma", desc: "British · female" },
+  { id: "bf_isabella", fam: "kokoro", name: "Isabella", desc: "British · female · gentle" },
   { id: "bm_george", fam: "kokoro", name: "George", desc: "British · male" },
+  { id: "bm_fable", fam: "kokoro", name: "Fable", desc: "British · male · storyteller, calm" },
 ];
 const KOKORO_N = () => VOICES.filter((v) => v.fam === "kokoro").length;
 const sizeOf = (v) => (v.fam === "piper" ? "63 MB" : `83 MB, shared by all ${KOKORO_N()}`);
 // Bump with every change to voice-worker.js or piper-worker.js: they're stored with the voices for offline use,
 // and the version in their address is what makes a phone fetch the new one instead of running a stored copy.
-const NV_REV = 13;
+const NV_REV = 14;
 const NV_WORKERS = { kokoro: `voice-worker.js?v=${NV_REV}`, piper: `piper-worker.js?v=${NV_REV}` };
 const NV_FILES = [
   ...Object.values(NV_WORKERS), "vendor/ort/ort.wasm.min.mjs", "vendor/ort/ort-wasm-simd-threaded.mjs", "vendor/ort/ort-wasm-simd-threaded.wasm",
@@ -1366,12 +1372,24 @@ function nvClipFor(page, idx) {
   const c = NV.clips.get(NV.cover.get(coverKey(page, idx)));
   return c && c.key.startsWith(`${T.bookId}|${nvVoice()}|`) ? c : null;
 }
+// the piece at idx plus any pieces that finish its sentence, so a passage never stops mid-sentence
+function wholeSentence(sents, idx) {
+  const cap = nvCur().fam === "kokoro" ? 430 : 900, take = [sents[idx]];
+  let len = (sents[idx].say || sents[idx].text).length;
+  while (take[take.length - 1].cont && idx + take.length < sents.length) {
+    const s = sents[idx + take.length];
+    if (s.spoken || len + s.text.length + 1 > cap) break;
+    take.push(s);
+    len += s.text.length + 1;
+  }
+  return take;
+}
 // a clip is a passage: one or more sentences in a row on one page, made into a single piece of audio
 function nvClip(page, start, sents) {
   const key = `${T.bookId}|${nvVoice()}|${page}|${start}|${sents.length}`;
   let c = NV.clips.get(key);
   if (!c) {
-    c = { key, page, start, n: sents.length, texts: sents.map((s) => s.text) };
+    c = { key, page, start, n: sents.length, texts: sents.map((s) => s.say || s.text) };
     c.text = c.texts.join(" ");
     c.promise = new Promise((res, rej) => { c.resolve = res; c.reject = rej; });
     c.promise.catch(() => {});
@@ -1413,6 +1431,7 @@ async function nvPlan() {
   let page = T.page, idx = T.idx, sents = T.sents, chars = 0, pages = 0;
   const bookId = T.bookId, gpu = NV.device === "gpu" && nvCur().fam === "kokoro";
   const maxChars = gpu ? 320 : 220, maxN = gpu ? 4 : 3, horizon = gpu ? 6000 : 1200;
+  const hardCap = nvCur().fam === "kokoro" ? 430 : 900;
   const cur = nvClipFor(page, idx);
   if (cur) idx = cur.start;
   let first = !cur;
@@ -1424,15 +1443,22 @@ async function nvPlan() {
       if (bookId !== T.bookId || !R.book) return;
       continue;
     }
+    // a piece read at the end of the previous page is skipped — unless reading starts right there
+    if (sents[idx].spoken && !(page === T.page && idx === T.idx)) { idx++; continue; }
     let c = nvClipFor(page, idx);
     if (!c || c.start !== idx) {
       const take = [sents[idx]];
-      let len = sents[idx].text.length;
-      while (!first && take.length < maxN && idx + take.length < sents.length) {
+      const size = (s) => (s.say || s.text).length + 1;
+      let len = size(sents[idx]);
+      // a passage never ends partway through a sentence: the voice's tone would reset mid-thought. Only the
+      // Kokoro model's length limit (about 500 sounds) can force a break.
+      const glue = () => take[take.length - 1].cont;
+      while (idx + take.length < sents.length && (glue() || (!first && take.length < maxN))) {
         const s = sents[idx + take.length];
-        if (len + s.text.length + 1 > maxChars || NV.cover.has(coverKey(page, idx + take.length))) break;
+        if (s.spoken || NV.cover.has(coverKey(page, idx + take.length))) break;
+        if (len + size(s) > (glue() ? hardCap : maxChars)) break;
         take.push(s);
-        len += s.text.length + 1;
+        len += size(s);
       }
       c = nvClip(page, idx, take);
     }
@@ -1580,8 +1606,26 @@ function unspace(str) {
   const lead = /^\s/.test(str) ? " " : "", trail = /\s$/.test(str) ? " " : "";
   return lead + str.trim().split(/ {2,}/).map((w) => w.replace(/ /g, "")).join(" ") + trail;
 }
+// A page's sentences, joined up across the page break: when a page ends mid-sentence, the end of the sentence
+// (the first piece of the next page) is read with it, and is skipped when reading carries on into that page.
 async function sentencesFor(i) {
   if (T.cache.has(i)) return T.cache.get(i);
+  const pdf = R.pdf;
+  const sents = (await rawSentencesFor(i)).map((s) => ({ ...s }));
+  if (i > 1 && sents.length) {
+    const prev = await rawSentencesFor(i - 1);
+    if (prev[prev.length - 1]?.cont) sents[0].spoken = true; // already read at the end of the previous page
+  }
+  const last = sents[sents.length - 1];
+  if (last?.cont && i < R.book.pages) {
+    const next = await rawSentencesFor(i + 1);
+    if (next[0]) last.say = last.text + " " + next[0].text;
+  }
+  if (pdf === R.pdf) T.cache.set(i, sents);
+  return sents;
+}
+async function rawSentencesFor(i) {
+  if (T.raw.has(i)) return T.raw.get(i);
   const pdf = R.pdf;
   const page = await pdf.getPage(i);
   const vp = page.getViewport({ scale: 1 });
@@ -1614,6 +1658,7 @@ async function sentencesFor(i) {
     const widest = Math.max(...lines.map(width));
     const headerish = (l) => {
       const t = l.items.map((x) => x.str).join("").trim();
+      if (/^\p{Lu}$/u.test(t) && l.items[0].fh > body * 1.5) return false; // a drop cap, not a header
       return !t || /^[\divxlc\s.,\-–—|·•:]+$/i.test(t) || width(l) < widest * 0.75 || Math.abs(l.items[0].fh - body) / body > 0.12;
     };
     for (let k = lines.length - 1; k >= 0; k--) {
@@ -1632,7 +1677,10 @@ async function sentencesFor(i) {
     const its = ln.items;
     // a heading (different size, or a short line with no closing punctuation before a capital) ends a sentence,
     // so it gets a pause instead of running into the paragraph below
-    if (prevLn && text && !/[.!?…:;,]["'”’)\]]*\s*$/.test(text)) {
+    // a drop cap (the big first letter of a chapter, "N" + "assim Nicholas…") is its own line: glue it back on
+    const dropCap = prevLn && /^\p{Lu}$/u.test(prevLn.items.map((x) => x.str).join("").trim()) && /^\s*\p{Ll}/u.test(its[0].str);
+    if (dropCap) text = text.replace(/\s+$/, "");
+    else if (prevLn && text && !/[.!?…:;,]["'”’)\]]*\s*$/.test(text)) {
       const pfh = prevLn.items[0].fh, short = prevLn.items[prevLn.items.length - 1].right - prevLn.items[0].x < widest * 0.6;
       if (Math.abs(its[0].fh - pfh) / pfh > 0.15 || (short && /^\s*[\p{Lu}\d“"]/u.test(its[0].str))) text = text.replace(/\s*$/, ". ");
     }
@@ -1647,7 +1695,7 @@ async function sentencesFor(i) {
       const median = g.length ? g[g.length >> 1] : 0;
       thr = Math.max(thr, median * 1.6 + fh * 0.04);
     }
-    if (text && !/\s$/.test(text)) text += " ";
+    if (text && !dropCap && !/\s$/.test(text)) text += " ";
     its.forEach((it, k) => {
       if (k && gaps[k - 1] > thr && !/\s$/.test(text) && !/^\s/.test(it.str)) text += " ";
       const start = text.length;
@@ -1672,13 +1720,16 @@ async function sentencesFor(i) {
       boxes.push({ x: r.x + r.w * f0, y: r.y, w: r.w * (f1 - f0), h: r.h });
     }
     if (!boxes.length) continue;
-    sents.push({ text: t, boxes, top: Math.min(...boxes.map((x) => x.y)), bottom: Math.max(...boxes.map((x) => x.y + x.h)) });
+    sents.push({
+      text: t, boxes, top: Math.min(...boxes.map((x) => x.y)), bottom: Math.max(...boxes.map((x) => x.y + x.h)),
+      cont: !/[.!?…]["'”’)\]]*$/.test(t), // the sentence goes on: the next piece (or page) finishes it
+    });
   }
   // drop running heads / footers that got past 1b: a short line hugging the edge with no sentence ending
   const edge = (s) => skip !== "off" && s.text.length < 60 && !/[.!?…]["'”’)]*$/.test(s.text) && (s.bottom < 0.1 || (skip === "both" && s.top > 0.9));
   while (sents.length && edge(sents[0])) sents.shift();
   while (sents.length && edge(sents[sents.length - 1])) sents.pop();
-  if (pdf === R.pdf) T.cache.set(i, sents);
+  if (pdf === R.pdf) T.raw.set(i, sents);
   return sents;
 }
 
@@ -1725,7 +1776,7 @@ function speakCurrent(retry = false) {
   const s = T.sents[T.idx];
   if (!s) return;
   const gen = ++T.gen;
-  const u = new SpeechSynthesisUtterance(s.text);
+  const u = new SpeechSynthesisUtterance(s.say || s.text);
   const v = currentVoice();
   if (v) { try { u.voice = v; u.lang = v.lang; } catch {} }
   u.rate = prefs.get("rate", 1);
@@ -1759,7 +1810,7 @@ async function nvSpeakCurrent() {
   const s = T.sents[T.idx];
   if (!s) return;
   const gen = ++T.gen;
-  const c = nvClipFor(T.page, T.idx) || nvClip(T.page, T.idx, [s]);
+  const c = nvClipFor(T.page, T.idx) || nvClip(T.page, T.idx, wholeSentence(T.sents, T.idx));
   drawTts(s);
   follow(s);
   nvPlan();
@@ -1824,17 +1875,21 @@ function drawProgress() {
   bar.style.width = frac === null ? "" : Math.round(frac * 100) + "%";
 }
 
-async function advance() {
+async function advance(starting = false) {
   T.idx++;
   let empties = 0;
-  while (T.idx >= T.sents.length) {
-    if (T.page >= R.book.pages) { ttsPause(); drawTts(null); toast("Finished — end of the book"); return; }
-    if (++empties > 8) { ttsPause(); toast("No readable text here — this part may be a scanned image", 4000); return; }
-    const gen = T.gen;
-    T.page++;
-    T.idx = 0;
-    T.sents = await sentencesFor(T.page);
-    if (gen !== T.gen || !T.playing) return;
+  for (;;) {
+    while (T.idx >= T.sents.length) {
+      if (T.page >= R.book.pages) { ttsPause(); drawTts(null); toast("Finished — end of the book"); return; }
+      if (++empties > 8) { ttsPause(); toast("No readable text here — this part may be a scanned image", 4000); return; }
+      const gen = T.gen;
+      T.page++;
+      T.idx = 0;
+      T.sents = await sentencesFor(T.page);
+      if (gen !== T.gen || !T.playing) return;
+    }
+    if (!starting && T.sents[T.idx].spoken) { T.idx++; continue; } // its words were read at the end of the last page
+    break;
   }
   speakCurrent();
   if (T.idx >= T.sents.length - 3 && T.page < R.book.pages) sentencesFor(T.page + 1).catch(() => {});
@@ -1880,7 +1935,7 @@ async function ttsPlay() {
   const k = sents.findIndex((s) => s.top >= v.f - 0.01);
   T.idx = (k === -1 ? sents.length : k) - 1;
   T.userScrollAt = 0;
-  advance();
+  advance(true);
 }
 function ttsPause() {
   T.playing = false;
