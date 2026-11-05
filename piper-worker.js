@@ -130,7 +130,9 @@ async function speak({ texts, text }) {
   const feeds = {
     input: new ort.Tensor("int64", BigInt64Array.from(ids, BigInt), [1, ids.length]),
     input_lengths: new ort.Tensor("int64", BigInt64Array.from([ids.length], BigInt), [1]),
-    scales: new ort.Tensor("float32", new Float32Array([inf.noise_scale ?? 0.667, inf.length_scale ?? 1, inf.noise_w ?? 0.8]), [3]),
+    // less of the voice's built-in randomness than its defaults (0.667 / 0.8): the same voice from one passage to
+    // the next, at the cost of a little expressiveness
+    scales: new ort.Tensor("float32", new Float32Array([Math.min(inf.noise_scale ?? 0.667, 0.45), inf.length_scale ?? 1, Math.min(inf.noise_w ?? 0.8, 0.55)]), [3]),
   };
   if ((config.num_speakers || 1) > 1 && session.inputNames.includes("sid")) feeds.sid = new ort.Tensor("int64", BigInt64Array.from([0n]), [1]);
   const res = await session.run(feeds);
